@@ -1,5 +1,17 @@
+# Dependencies — Vercel installs them via composer
 /vendor/
+
+# Logs
 /logs/
-/uploads/
-.env
 *.log
+
+# User uploads
+/uploads/
+
+# Local env files
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
