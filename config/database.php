@@ -78,7 +78,7 @@ if (!defined('JWT_ALGO')) {
 }
 
 // ============================================
-// 3. DIRECT CONNECTION (with enhanced error reporting)
+// 3. DIRECT CONNECTION
 // ============================================
 try {
     $dsn = "mysql:host=$db_host;port=$db_port;dbname=$db_name;charset=utf8mb4";
@@ -90,19 +90,19 @@ try {
         PDO::ATTR_TIMEOUT => 10,
     ];
 
-    // Aiven SSL configuration
     if ($use_ssl && $ssl_ca_path && file_exists($ssl_ca_path)) {
         $options[PDO::MYSQL_ATTR_SSL_CA] = $ssl_ca_path;
         $options[PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT] = false;
     } elseif ($use_ssl) {
-        // SSL required but no CA file — try without cert verification
         $options[PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT] = false;
     }
 
     $conn = new PDO($dsn, $db_username, $db_password, $options);
 
+    // FIX: Aiven MySQL 8.4 disables ONLY_FULL_GROUP_BY per-session
+    $conn->exec("SET SESSION sql_mode = 'NO_ENGINE_SUBSTITUTION'");
+
 } catch (Throwable $e) {
-    // Throwable catches BOTH PDOException and PHP fatal errors
     header('Content-Type: application/json');
     http_response_code(500);
     echo json_encode([
@@ -164,6 +164,10 @@ class Database {
                 $options[PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT] = false;
             }
             $this->conn = new PDO($dsn, $this->username, $this->password, $options);
+
+            // FIX: Aiven MySQL 8.4 strict mode compatibility
+            $this->conn->exec("SET SESSION sql_mode = 'NO_ENGINE_SUBSTITUTION'");
+
             return $this->conn;
         } catch (Throwable $e) {
             error_log("Database::getConnection failed: " . $e->getMessage());
