@@ -12,7 +12,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 }
 
 error_reporting(E_ALL);
-ini_set('display_errors', 1);
+ini_set('display_errors', 0);
 ini_set('log_errors', 1);
 
 require_once __DIR__ . '/../config/database.php';
@@ -22,43 +22,45 @@ $id = isset($_GET['id']) ? $_GET['id'] : null;
 $action = isset($_GET['action']) ? $_GET['action'] : null;
 
 // ============================================
-// GET - Handle all GET requests
+// Helper: build profile picture URL for both local & Vercel
+// ============================================
+function fix_profile_url(?string $pic, ?string $requestHost = null): ?string {
+    if (empty($pic)) return $pic;
+    if (str_starts_with($pic, 'http')) return $pic;
+
+    // On Vercel, images would need to be hosted elsewhere (S3/Blob/Cloudinary).
+    // For local XAMPP, use localhost path.
+    if (getenv('VERCEL') === '1') {
+        // Return just the relative path — frontend uses VITE_MEDIA_BASE_URL
+        return $pic;
+    }
+    return 'http://localhost/smart-pos-api' . $pic;
+}
+
+// ============================================
+// GET
 // ============================================
 if ($method === 'GET') {
     try {
-        // Handle action=me (get current user)
         if ($action === 'me') {
-            // For demo, get the first user or use session
-            // In production, use JWT token
             $query = "SELECT id, username, full_name, email, role, roles, status, department, phone, 
                              profile_picture, created_at 
                       FROM users 
                       WHERE status = 'active' OR status IS NULL
                       LIMIT 1";
-            
             $stmt = $conn->prepare($query);
             $stmt->execute();
             $result = $stmt->fetch(PDO::FETCH_ASSOC);
             
             if ($result) {
-                // Parse roles
                 if (!empty($result['roles'])) {
                     $roles = json_decode($result['roles'], true);
-                    if (!is_array($roles)) {
-                        $roles = [$result['role'] ?? 'staff'];
-                    }
+                    if (!is_array($roles)) $roles = [$result['role'] ?? 'staff'];
                 } else {
                     $roles = [$result['role'] ?? 'staff'];
                 }
                 $result['roles'] = $roles;
-                
-                // Fix profile picture URL
-                if (!empty($result['profile_picture'])) {
-                    if (!str_starts_with($result['profile_picture'], 'http')) {
-                        $result['profile_picture'] = 'http://localhost/smart-pos-api' . $result['profile_picture'];
-                    }
-                }
-                
+                $result['profile_picture'] = fix_profile_url($result['profile_picture']);
                 echo json_encode($result);
             } else {
                 http_response_code(404);
@@ -67,36 +69,24 @@ if ($method === 'GET') {
             exit();
         }
         
-        // Get user by ID
         if ($id) {
             $query = "SELECT id, username, full_name, email, role, roles, status, department, phone, 
                              profile_picture, created_at 
-                      FROM users 
-                      WHERE id = :id";
+                      FROM users WHERE id = :id";
             $stmt = $conn->prepare($query);
             $stmt->bindValue(':id', $id);
             $stmt->execute();
             $result = $stmt->fetch(PDO::FETCH_ASSOC);
             
             if ($result) {
-                // Parse roles
                 if (!empty($result['roles'])) {
                     $roles = json_decode($result['roles'], true);
-                    if (!is_array($roles)) {
-                        $roles = [$result['role'] ?? 'staff'];
-                    }
+                    if (!is_array($roles)) $roles = [$result['role'] ?? 'staff'];
                 } else {
                     $roles = [$result['role'] ?? 'staff'];
                 }
                 $result['roles'] = $roles;
-                
-                // Fix profile picture URL
-                if (!empty($result['profile_picture'])) {
-                    if (!str_starts_with($result['profile_picture'], 'http')) {
-                        $result['profile_picture'] = 'http://localhost/smart-pos-api' . $result['profile_picture'];
-                    }
-                }
-                
+                $result['profile_picture'] = fix_profile_url($result['profile_picture']);
                 echo json_encode($result);
             } else {
                 http_response_code(404);
@@ -105,36 +95,26 @@ if ($method === 'GET') {
             exit();
         }
         
-        // Get all users
         $query = "SELECT id, username, full_name, email, role, roles, status, department, phone,
                          profile_picture, created_at 
                   FROM users 
                   WHERE status = 'active' OR status IS NULL
                   ORDER BY full_name ASC";
-        
         $stmt = $conn->prepare($query);
         $stmt->execute();
         $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
         
-        // Parse roles for each user
         foreach ($results as &$user) {
             if (!empty($user['roles'])) {
                 $roles = json_decode($user['roles'], true);
-                if (!is_array($roles)) {
-                    $roles = [$user['role'] ?? 'staff'];
-                }
+                if (!is_array($roles)) $roles = [$user['role'] ?? 'staff'];
             } else {
                 $roles = [$user['role'] ?? 'staff'];
             }
             $user['roles'] = $roles;
-            
-            // Fix profile picture URL
-            if (!empty($user['profile_picture'])) {
-                if (!str_starts_with($user['profile_picture'], 'http')) {
-                    $user['profile_picture'] = 'http://localhost/smart-pos-api' . $user['profile_picture'];
-                }
-            }
+            $user['profile_picture'] = fix_profile_url($user['profile_picture']);
         }
+        unset($user);
         
         echo json_encode($results);
         
@@ -157,21 +137,16 @@ if ($method === 'PUT') {
         }
         
         $data = json_decode(file_get_contents('php://input'), true);
-        
         if (!$data) {
             http_response_code(400);
             echo json_encode(['success' => false, 'message' => 'Invalid JSON data']);
             exit();
         }
         
-        // Log the received data for debugging
-        error_log('PUT data: ' . print_r($data, true));
-        
         $checkQuery = "SELECT id FROM users WHERE id = :id";
         $checkStmt = $conn->prepare($checkQuery);
         $checkStmt->bindValue(':id', $id);
         $checkStmt->execute();
-        
         if (!$checkStmt->fetch()) {
             http_response_code(404);
             echo json_encode(['success' => false, 'message' => 'User not found']);
@@ -181,32 +156,29 @@ if ($method === 'PUT') {
         $updates = [];
         $params = [':id' => $id];
         
-        // Basic fields
-        $fields = ['full_name', 'email', 'department', 'phone', 'status'];
-        
-        foreach ($fields as $field) {
+        foreach (['full_name', 'email', 'department', 'phone', 'status'] as $field) {
             if (isset($data[$field])) {
                 $updates[] = "$field = :$field";
                 $params[":$field"] = $data[$field];
             }
         }
         
-        // ✅ Handle profile picture - FIXED
         if (isset($data['profile_picture']) && !empty($data['profile_picture'])) {
             $profilePicture = $data['profile_picture'];
             
-            // Check if it's a base64 image
             if (strpos($profilePicture, 'data:image') === 0) {
                 try {
-                    // Decode base64 image
                     $image_parts = explode(';base64,', $profilePicture);
                     if (count($image_parts) >= 2) {
                         $image_type_aux = explode('image/', $image_parts[0]);
                         $image_type = $image_type_aux[1] ?? 'png';
                         $image_base64 = base64_decode($image_parts[1]);
                         
-                        // Create uploads directory if not exists
-                        $upload_dir = __DIR__ . '/../uploads/profiles/';
+                        $isVercel = getenv('VERCEL') === '1';
+                        $upload_dir = $isVercel
+                            ? sys_get_temp_dir() . '/uploads/profiles/'
+                            : __DIR__ . '/../uploads/profiles/';
+                        
                         if (!file_exists($upload_dir)) {
                             mkdir($upload_dir, 0777, true);
                         }
@@ -218,24 +190,18 @@ if ($method === 'PUT') {
                             $profilePath = '/uploads/profiles/' . $filename;
                             $updates[] = "profile_picture = :profile_picture";
                             $params[':profile_picture'] = $profilePath;
-                            error_log('Profile picture saved: ' . $profilePath);
-                        } else {
-                            error_log('Failed to save profile picture');
                         }
                     }
                 } catch (Exception $e) {
                     error_log('Error saving profile picture: ' . $e->getMessage());
                 }
             } else {
-                // It's already a path or URL
                 $updates[] = "profile_picture = :profile_picture";
                 $params[':profile_picture'] = $profilePicture;
             }
         }
         
-        // ✅ Handle password change
         if (isset($data['current_password']) && isset($data['new_password']) && !empty($data['new_password'])) {
-            // Verify current password
             $passQuery = "SELECT password FROM users WHERE id = :id";
             $passStmt = $conn->prepare($passQuery);
             $passStmt->bindValue(':id', $id);
@@ -243,14 +209,12 @@ if ($method === 'PUT') {
             $userData = $passStmt->fetch(PDO::FETCH_ASSOC);
             
             if ($userData) {
-                $currentPassword = $data['current_password'];
                 $storedPassword = $userData['password'];
-                
                 $passwordMatch = false;
                 if (strpos($storedPassword, '$2y$') === 0) {
-                    $passwordMatch = password_verify($currentPassword, $storedPassword);
+                    $passwordMatch = password_verify($data['current_password'], $storedPassword);
                 } else {
-                    $passwordMatch = ($currentPassword === $storedPassword);
+                    $passwordMatch = ($data['current_password'] === $storedPassword);
                 }
                 
                 if ($passwordMatch) {
@@ -273,13 +237,11 @@ if ($method === 'PUT') {
         
         $query = "UPDATE users SET " . implode(', ', $updates) . " WHERE id = :id";
         $stmt = $conn->prepare($query);
-        
         foreach ($params as $key => $value) {
             $stmt->bindValue($key, $value);
         }
         
         if ($stmt->execute()) {
-            // Get updated user data to return
             $getQuery = "SELECT id, username, full_name, email, role, roles, status, department, phone, profile_picture, created_at FROM users WHERE id = :id";
             $getStmt = $conn->prepare($getQuery);
             $getStmt->bindValue(':id', $id);
@@ -287,23 +249,14 @@ if ($method === 'PUT') {
             $updatedUser = $getStmt->fetch(PDO::FETCH_ASSOC);
             
             if ($updatedUser) {
-                // Parse roles
                 if (!empty($updatedUser['roles'])) {
                     $roles = json_decode($updatedUser['roles'], true);
-                    if (!is_array($roles)) {
-                        $roles = [$updatedUser['role'] ?? 'staff'];
-                    }
+                    if (!is_array($roles)) $roles = [$updatedUser['role'] ?? 'staff'];
                 } else {
                     $roles = [$updatedUser['role'] ?? 'staff'];
                 }
                 $updatedUser['roles'] = $roles;
-                
-                // Fix profile picture URL
-                if (!empty($updatedUser['profile_picture'])) {
-                    if (!str_starts_with($updatedUser['profile_picture'], 'http')) {
-                        $updatedUser['profile_picture'] = 'http://localhost/smart-pos-api' . $updatedUser['profile_picture'];
-                    }
-                }
+                $updatedUser['profile_picture'] = fix_profile_url($updatedUser['profile_picture']);
             }
             
             echo json_encode([
@@ -325,7 +278,7 @@ if ($method === 'PUT') {
 }
 
 // ============================================
-// POST - Create User
+// POST - Create User (with detailed error reporting)
 // ============================================
 if ($method === 'POST') {
     try {
@@ -345,14 +298,9 @@ if ($method === 'POST') {
         $department = isset($data['department']) ? $data['department'] : 'General';
         $phone = isset($data['phone']) ? $data['phone'] : '';
         
-        // Handle multiple roles
         $roles = isset($data['roles']) ? $data['roles'] : [$role];
-        if (!is_array($roles)) {
-            $roles = [$role];
-        }
-        if (!in_array($role, $roles)) {
-            array_unshift($roles, $role);
-        }
+        if (!is_array($roles)) $roles = [$role];
+        if (!in_array($role, $roles)) array_unshift($roles, $role);
         $rolesJson = json_encode(array_unique($roles));
         
         if (empty($username)) {
@@ -360,7 +308,6 @@ if ($method === 'POST') {
             echo json_encode(['success' => false, 'message' => 'Username is required']);
             exit();
         }
-        
         if (empty($full_name)) {
             http_response_code(400);
             echo json_encode(['success' => false, 'message' => 'Full name is required']);
@@ -371,7 +318,6 @@ if ($method === 'POST') {
         $checkStmt = $conn->prepare($checkQuery);
         $checkStmt->bindValue(':username', $username);
         $checkStmt->execute();
-        
         if ($checkStmt->fetch()) {
             http_response_code(400);
             echo json_encode(['success' => false, 'message' => 'Username already exists']);
@@ -406,7 +352,13 @@ if ($method === 'POST') {
         }
     } catch (PDOException $e) {
         http_response_code(500);
-        echo json_encode(['success' => false, 'message' => 'Database error: ' . $e->getMessage()]);
+        echo json_encode([
+            'success' => false, 
+            'message' => 'Database error: ' . $e->getMessage(),
+            'error_code' => $e->getCode(),
+            'file' => $e->getFile(),
+            'line' => $e->getLine()
+        ]);
     } catch (Exception $e) {
         http_response_code(500);
         echo json_encode(['success' => false, 'message' => $e->getMessage()]);
@@ -446,5 +398,4 @@ if ($method === 'DELETE') {
 
 http_response_code(405);
 echo json_encode(['success' => false, 'message' => 'Method not allowed']);
-exit();
 ?>

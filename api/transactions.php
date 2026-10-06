@@ -1,6 +1,8 @@
 <?php
+// ✅ FIXED: use shared config so it works on Vercel + Aiven
 require_once __DIR__ . '/../config/cors.php';
-header("Access-Control-Allow-Origin: *");
+require_once __DIR__ . '/../config/database.php';   // ← ADDED: uses Aiven credentials + SSL
+
 header("Content-Type: application/json; charset=UTF-8");
 header("Access-Control-Allow-Methods: POST, GET, PUT, DELETE, OPTIONS");
 header("Access-Control-Max-Age: 3600");
@@ -11,19 +13,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
     exit();
 }
 
-$host = 'localhost';
-$db_name = 'smart_pos';
-$username = 'root';
-$password = '';
-
-try {
-    $conn = new PDO("mysql:host=$host;dbname=$db_name", $username, $password);
-    $conn->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
-} catch(PDOException $e) {
-    http_response_code(500);
-    echo json_encode(['success' => false, 'message' => 'Database connection failed']);
-    exit();
-}
+// ✅ $conn is now from config/database.php (Aiven + SSL + sql_mode fix)
 
 $method = $_SERVER['REQUEST_METHOD'];
 
@@ -80,7 +70,6 @@ if ($method === 'POST') {
         exit();
     }
     
-    // ✅ FIXED: Added user_id to the INSERT
     $user_id = $data['user_id'] ?? 1;
     $description = $data['description'] ?? '';
     $amount = $data['amount'] ?? 0;
