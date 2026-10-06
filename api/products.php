@@ -11,8 +11,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
     exit();
 }
 
-// ✅ ABSOLUTE PATH FIX
-require_once 'C:/xampp/htdocs/smart-pos-api/config/database.php';
+// ✅ FIXED: use __DIR__ for portability (works on XAMPP + Vercel)
+require_once __DIR__ . '/../config/database.php';
 
 $method = $_SERVER['REQUEST_METHOD'];
 
@@ -71,7 +71,7 @@ if ($method === 'GET') {
 // ============================================
 if ($method === 'POST') {
     try {
-        // ✅ FIX: Handle both JSON and FormData
+        // ✅ Handle both JSON and FormData
         if (!empty($_POST)) {
             $data = $_POST;
         } else {
@@ -87,9 +87,13 @@ if ($method === 'POST') {
         $status = isset($data['status']) ? $data['status'] : 'active';
         $image_url = '';
 
-        // Handle image upload if it exists
+        // ✅ FIXED: use sys_get_temp_dir() on Vercel (read-only filesystem)
         if (isset($_FILES['image']) && $_FILES['image']['error'] === UPLOAD_ERR_OK) {
-            $uploadDir = 'C:/xampp/htdocs/smart-pos-api/uploads/products/';
+            $isVercel = getenv('VERCEL') === '1';
+            $uploadDir = $isVercel
+                ? sys_get_temp_dir() . '/uploads/products/'
+                : __DIR__ . '/../uploads/products/';
+
             if (!is_dir($uploadDir)) {
                 mkdir($uploadDir, 0777, true);
             }
@@ -146,7 +150,6 @@ if ($method === 'PUT') {
             exit();
         }
 
-        // ✅ FIX: Handle both JSON and FormData
         if (!empty($_POST)) {
             $data = $_POST;
         } else {
@@ -163,9 +166,12 @@ if ($method === 'PUT') {
         if (isset($data['category_id'])) { $updates[] = "category_id = :category_id"; $params[':category_id'] = $data['category_id']; }
         if (isset($data['status'])) { $updates[] = "status = :status"; $params[':status'] = $data['status']; }
 
-        // Handle image upload if it exists
         if (isset($_FILES['image']) && $_FILES['image']['error'] === UPLOAD_ERR_OK) {
-            $uploadDir = 'C:/xampp/htdocs/smart-pos-api/uploads/products/';
+            $isVercel = getenv('VERCEL') === '1';
+            $uploadDir = $isVercel
+                ? sys_get_temp_dir() . '/uploads/products/'
+                : __DIR__ . '/../uploads/products/';
+
             if (!is_dir($uploadDir)) {
                 mkdir($uploadDir, 0777, true);
             }

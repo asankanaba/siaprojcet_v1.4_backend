@@ -11,8 +11,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
     exit();
 }
 
-// ✅ ABSOLUTE PATH FIX (Matches your XAMPP structure)
-require_once 'C:/xampp/htdocs/smart-pos-api/config/database.php';
+// ✅ FIXED: use __DIR__ for portability
+require_once __DIR__ . '/../config/database.php';
 
 $method = $_SERVER['REQUEST_METHOD'];
 
@@ -27,7 +27,6 @@ if ($method === 'GET') {
         $settings = $stmt->fetch(PDO::FETCH_ASSOC);
         
         if (!$settings) {
-            // Return default settings if none exist
             $settings = [
                 'store_name' => 'Smart POS Store',
                 'store_address' => '123 Main Street, City',
@@ -70,7 +69,6 @@ if ($method === 'GET') {
 // ============================================
 if ($method === 'POST') {
     try {
-        // Handle both JSON and FormData
         if (!empty($_POST)) {
             $data = $_POST;
         } else {
@@ -83,14 +81,12 @@ if ($method === 'POST') {
             exit();
         }
         
-        // Check if settings exist
         $checkSql = "SELECT COUNT(*) as count FROM settings";
         $checkStmt = $conn->prepare($checkSql);
         $checkStmt->execute();
         $exists = $checkStmt->fetch(PDO::FETCH_ASSOC)['count'] > 0;
         
         if ($exists) {
-            // Update existing settings
             $sql = "UPDATE settings SET 
                 store_name = :store_name,
                 store_address = :store_address,
@@ -119,7 +115,6 @@ if ($method === 'POST') {
                 primary_color = :primary_color
             ";
         } else {
-            // Insert new settings
             $sql = "INSERT INTO settings (
                 store_name, store_address, store_phone, store_email, currency, tax_rate, tax_type,
                 default_discount, low_stock_threshold, receipt_footer, show_tax_on_receipt,

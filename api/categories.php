@@ -11,8 +11,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
     exit();
 }
 
-// ✅ ABSOLUTE PATH FIX (Matches your XAMPP structure)
-require_once 'C:/xampp/htdocs/smart-pos-api/config/database.php';
+// ✅ FIXED: use __DIR__ for portability (works on XAMPP + Vercel)
+require_once __DIR__ . '/../config/database.php';
 
 $method = $_SERVER['REQUEST_METHOD'];
 
@@ -38,7 +38,6 @@ if ($method === 'GET') {
 // ============================================
 if ($method === 'POST') {
     try {
-        // Handle both JSON and FormData
         if (!empty($_POST)) {
             $data = $_POST;
         } else {

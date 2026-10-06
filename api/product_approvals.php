@@ -10,7 +10,8 @@ if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
     exit();
 }
 
-require_once 'C:/xampp/htdocs/smart-pos-api/config/database.php';
+// ✅ FIXED: use __DIR__ for portability
+require_once __DIR__ . '/../config/database.php';
 
 $method = $_SERVER['REQUEST_METHOD'];
 $id = isset($_GET['id']) ? $_GET['id'] : null;
@@ -88,7 +89,12 @@ if ($method === 'POST') {
         }
 
         if (isset($_FILES['image']) && $_FILES['image']['error'] === UPLOAD_ERR_OK) {
-            $uploadDir = 'C:/xampp/htdocs/smart-pos-api/uploads/products/';
+            // ✅ FIXED: use temp dir on Vercel
+            $isVercel = getenv('VERCEL') === '1';
+            $uploadDir = $isVercel
+                ? sys_get_temp_dir() . '/uploads/products/'
+                : __DIR__ . '/../uploads/products/';
+
             if (!is_dir($uploadDir)) {
                 mkdir($uploadDir, 0777, true);
             }
@@ -167,7 +173,6 @@ if ($method === 'PUT') {
         $stmt->bindValue(':id', $id);
         $stmt->execute();
         
-        // ✅ If approved, create the product AND send a notification
         if ($status === 'approved') {
             $insertQuery = "INSERT INTO products (name, description, price, stock, category_id, image_url, barcode, status) 
                             VALUES (:name, :description, :price, :stock, :category_id, :image_url, :barcode, 'active')";
@@ -187,7 +192,6 @@ if ($method === 'PUT') {
             $updateStmt->bindValue(':id', $id);
             $updateStmt->execute();
 
-            // ✅ INSERT NOTIFICATION FOR THE REQUESTER
             $notifMsg = "Your product request for '{$approval['product_name']}' has been approved and added to inventory!";
             $notifQuery = "INSERT INTO notifications (user_id, message, type) VALUES (:user_id, :message, 'success')";
             $notifStmt = $conn->prepare($notifQuery);
@@ -195,7 +199,6 @@ if ($method === 'PUT') {
             $notifStmt->bindValue(':message', $notifMsg);
             $notifStmt->execute();
         } else if ($status === 'rejected') {
-            // ✅ INSERT NOTIFICATION FOR REJECTION
             $notifMsg = "Your product request for '{$approval['product_name']}' has been rejected.";
             $notifQuery = "INSERT INTO notifications (user_id, message, type) VALUES (:user_id, :message, 'warning')";
             $notifStmt = $conn->prepare($notifQuery);
