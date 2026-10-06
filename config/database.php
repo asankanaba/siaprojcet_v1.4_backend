@@ -20,10 +20,8 @@ function smartpos_is_production(): bool {
     if ($env === 'production') return true;
     if ($env === 'development' || $env === 'local') return false;
 
-    // If DB_HOST env var is set (Vercel), it's production
     if (getenv('DB_HOST')) return true;
 
-    // Auto-detect from request host
     $host = $_SERVER['HTTP_HOST'] ?? $_SERVER['SERVER_NAME'] ?? '';
     $host = strtolower(preg_replace('/:\d+$/', '', $host));
 
@@ -48,11 +46,7 @@ $isProduction = smartpos_is_production();
 // ============================================
 // 1. DATABASE CREDENTIALS
 // ============================================
-// 🌐 Production: ALL credentials come from environment variables.
-// 💻 Local:      Falls back to standard XAMPP defaults.
-
 if (getenv('DB_HOST')) {
-    // 🌐 Vercel + Aiven — everything from env vars
     $db_host     = getenv('DB_HOST');
     $db_name     = getenv('DB_NAME');
     $db_username = getenv('DB_USER');
@@ -61,7 +55,6 @@ if (getenv('DB_HOST')) {
     $use_ssl     = true;
     $ssl_ca_path = __DIR__ . '/ca.pem';
 } else {
-    // 💻 Local XAMPP only — no production secrets here
     $db_host     = '127.0.0.1';
     $db_name     = 'smart_pos';
     $db_username = 'root';
@@ -85,7 +78,7 @@ if (!defined('JWT_ALGO')) {
 }
 
 // ============================================
-// 3. DIRECT CONNECTION
+// 3. DIRECT CONNECTION (with enhanced error reporting)
 // ============================================
 try {
     $dsn = "mysql:host=$db_host;port=$db_port;dbname=$db_name;charset=utf8mb4";
@@ -94,22 +87,36 @@ try {
         PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
         PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
         PDO::ATTR_EMULATE_PREPARES => false,
+        PDO::ATTR_TIMEOUT => 10,
     ];
 
+    // Aiven SSL configuration
     if ($use_ssl && $ssl_ca_path && file_exists($ssl_ca_path)) {
         $options[PDO::MYSQL_ATTR_SSL_CA] = $ssl_ca_path;
+        $options[PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT] = false;
+    } elseif ($use_ssl) {
+        // SSL required but no CA file — try without cert verification
         $options[PDO::MYSQL_ATTR_SSL_VERIFY_SERVER_CERT] = false;
     }
 
     $conn = new PDO($dsn, $db_username, $db_password, $options);
 
-} catch (PDOException $e) {
+} catch (Throwable $e) {
+    // Throwable catches BOTH PDOException and PHP fatal errors
     header('Content-Type: application/json');
     http_response_code(500);
     echo json_encode([
         'success' => false,
-        'message' => 'Database connection failed: ' . $e->getMessage(),
-        'env'     => $isProduction ? 'production' : 'local'
+        'message' => 'DB connection failed: ' . $e->getMessage(),
+        'file'    => $e->getFile(),
+        'line'    => $e->getLine(),
+        'env'     => $isProduction ? 'production' : 'local',
+        'host'    => $db_host,
+        'port'    => $db_port,
+        'db'      => $db_name,
+        'user'    => $db_username,
+        'ssl'     => $use_ssl,
+        'ca_exists' => $ssl_ca_path ? file_exists($ssl_ca_path) : false,
     ]);
     exit();
 }
@@ -150,6 +157,7 @@ class Database {
             $options = [
                 PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
                 PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+                PDO::ATTR_TIMEOUT => 10,
             ];
             if ($this->ssl_ca && file_exists($this->ssl_ca)) {
                 $options[PDO::MYSQL_ATTR_SSL_CA] = $this->ssl_ca;
@@ -157,13 +165,15 @@ class Database {
             }
             $this->conn = new PDO($dsn, $this->username, $this->password, $options);
             return $this->conn;
-        } catch (PDOException $e) {
+        } catch (Throwable $e) {
             error_log("Database::getConnection failed: " . $e->getMessage());
             header('Content-Type: application/json');
             http_response_code(500);
             echo json_encode([
                 'success' => false,
-                'message' => 'Database connection failed: ' . $e->getMessage(),
+                'message' => 'DB connection failed: ' . $e->getMessage(),
+                'file'    => $e->getFile(),
+                'line'    => $e->getLine(),
             ]);
             exit();
         }
@@ -289,7 +299,7 @@ if (!function_exists('createNotification')) {
             $stmt->bindValue(':type', $type, PDO::PARAM_STR);
             $stmt->bindValue(':severity', $severity, PDO::PARAM_STR);
             return $stmt->execute();
-        } catch (PDOException $e) {
+        } catch (Throwable $e) {
             error_log("createNotification error: " . $e->getMessage());
             return false;
         }
@@ -343,7 +353,7 @@ if (!function_exists('notifyRole')) {
                 }
             }
             return $count;
-        } catch (PDOException $e) {
+        } catch (Throwable $e) {
             error_log("notifyRole error: " . $e->getMessage());
             return 0;
         }
