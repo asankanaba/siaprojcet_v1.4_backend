@@ -1,8 +1,16 @@
 <?php
 // ============================================
 // 📁 File: api/supply_chain.php
-// 🔧 Supply Chain Requests Flow
-// Flow: pending → approved (Finance) → ordered → received (stock++)
+// 🔧 Supply Chain Requests Flow (7 statuses)
+//
+// FLOW:
+//   pending    → Staff creates request
+//   approved   → Finance approves budget
+//   rejected   → Finance denies budget
+//   ordered    → Supply Chain placed order with supplier
+//   unavailable→ Supplier has no stock
+//   received   → Goods arrived, stock++
+//   paid       → Finance paid supplier via PayMongo
 // ============================================
 
 header('Content-Type: application/json');
@@ -26,7 +34,7 @@ try {
     $conn = $db->getConnection();
 
     // ============================================
-    // GET — fetch requests / products / low stock
+    // GET
     // ============================================
     if ($method === 'GET') {
 
@@ -74,17 +82,19 @@ try {
             exit();
         }
 
-        // --- Single request by id ---
+        // --- Single request ---
         if (isset($_GET['id'])) {
             $stmt = $conn->prepare("
-                SELECT r.*, p.name AS product_name, s.name AS supplier_name,
+                SELECT r.*,
+                       p.name AS product_name, p.stock AS product_stock,
+                       s.name AS supplier_name, s.stock_available AS supplier_stock,
                        u.full_name AS requester_name,
                        a.full_name AS approver_name
                 FROM supply_chain_requests r
-                LEFT JOIN products  p ON r.product_id    = p.id
-                LEFT JOIN suppliers s ON r.supplier_id   = s.id
-                LEFT JOIN users     u ON r.requested_by  = u.id
-                LEFT JOIN users     a ON r.approved_by   = a.id
+                LEFT JOIN products  p ON r.product_id   = p.id
+                LEFT JOIN suppliers s ON r.supplier_id  = s.id
+                LEFT JOIN users     u ON r.requested_by = u.id
+                LEFT JOIN users     a ON r.approved_by  = a.id
                 WHERE r.id = ?
             ");
             $stmt->execute([(int)$_GET['id']]);
@@ -100,7 +110,9 @@ try {
 
         // --- List all requests ---
         $stmt = $conn->prepare("
-            SELECT r.*, p.name AS product_name, s.name AS supplier_name,
+            SELECT r.*,
+                   p.name AS product_name,
+                   s.name AS supplier_name,
                    u.full_name AS requester_name,
                    a.full_name AS approver_name
             FROM supply_chain_requests r
@@ -113,13 +125,12 @@ try {
         $stmt->execute();
         $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-        // Ensure frontend receives an array (either response.data or response.data.data)
         echo json_encode(['success' => true, 'data' => $rows]);
         exit();
     }
 
     // ============================================
-    // POST — create new supply chain request
+    // POST — Staff creates a request
     // ============================================
     if ($method === 'POST') {
         $productId   = (int)($input['product_id']   ?? 0);
@@ -156,20 +167,6 @@ try {
                 exit();
             }
 
-            // Check budget
-            $stmt = $conn->prepare("
-                SELECT allocated_amount, spent_amount
-                FROM budgets
-                WHERE category IN ('Supply Chain', 'Operations')
-                ORDER BY id DESC
-                LIMIT 1
-            ");
-            $stmt->execute();
-            $budget = $stmt->fetch(PDO::FETCH_ASSOC);
-
-            $totalCost = ((float)($product['cost'] ?? 0)) * $quantity;
-            $hasBudget = $budget && (($budget['allocated_amount'] - $budget['spent_amount']) >= $totalCost);
-
             // Find a supplier for this product
             $stmt = $conn->prepare("
                 SELECT id, name, stock_available, price_per_unit, lead_time_days
@@ -184,64 +181,11 @@ try {
             $unitPrice = $supplier['price_per_unit'] ?? ($product['cost'] ?? 0);
             $finalCost = $unitPrice * $quantity;
 
-            // ---- No budget → create a budget request, keep status = pending ----
-            if (!$hasBudget) {
-                $stmt = $conn->prepare("
-                    INSERT INTO budget_requests
-                        (requested_by, department, purpose, amount, status)
-                    VALUES (?, 'Supply Chain', ?, ?, 'pending')
-                ");
-                $stmt->execute([
-                    $requestedBy,
-                    "Restock {$quantity} units of {$product['name']}",
-                    $finalCost,
-                ]);
-                $budgetRequestId = (int)$conn->lastInsertId();
-
-                // Still create the supply chain request as pending, linked to budget request
-                $stmt = $conn->prepare("
-                    INSERT INTO supply_chain_requests
-                        (product_id, supplier_id, quantity, status, requested_by, total_cost, notes, created_at)
-                    VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW())
-                ");
-                $stmt->execute([
-                    $productId,
-                    $supplier['id'] ?? null,
-                    $quantity,
-                    $requestedBy,
-                    $finalCost,
-                    trim($notes . " [Budget Request #{$budgetRequestId}]"),
-                ]);
-                $scRequestId = (int)$conn->lastInsertId();
-
-                // Notify Finance
-                if (function_exists('notifyRole')) {
-                    notifyRole(
-                        $conn,
-                        ['finance', 'super_admin', 'admin'],
-                        '⚠️ Budget Approval Needed',
-                        "{$product['name']} restock requested ({$quantity} units). Est. ₱" . number_format($finalCost, 2),
-                        'warning',
-                        'warning'
-                    );
-                }
-
-                $conn->commit();
-                echo json_encode([
-                    'success'    => true,
-                    'status'     => 'pending',
-                    'message'    => 'Request submitted. Waiting for Finance approval.',
-                    'request_id' => $scRequestId,
-                    'budget_request_id' => $budgetRequestId,
-                ]);
-                exit();
-            }
-
-            // ---- Has budget → create request as approved, ready for Supply Chain to order ----
+            // Create request with status = pending (waits for Finance)
             $stmt = $conn->prepare("
                 INSERT INTO supply_chain_requests
                     (product_id, supplier_id, quantity, status, requested_by, total_cost, notes, created_at)
-                VALUES (?, ?, ?, 'approved', ?, ?, ?, NOW())
+                VALUES (?, ?, ?, 'pending', ?, ?, ?, NOW())
             ");
             $stmt->execute([
                 $productId,
@@ -253,23 +197,23 @@ try {
             ]);
             $scRequestId = (int)$conn->lastInsertId();
 
-            // Notify Supply Chain + Finance
+            // Notify Finance
             if (function_exists('notifyRole')) {
                 notifyRole(
                     $conn,
-                    ['supply_chain', 'super_admin', 'admin'],
-                    '📦 Restock Approved — Ready to Order',
-                    "{$product['name']} × {$quantity} from " . ($supplier['name'] ?? 'supplier'),
-                    'info',
-                    'info'
+                    ['finance', 'super_admin', 'admin'],
+                    '⚠️ Budget Approval Needed',
+                    "{$product['name']} × {$quantity} requested — Est. ₱" . number_format($finalCost, 2),
+                    'warning',
+                    'warning'
                 );
             }
 
             $conn->commit();
             echo json_encode([
                 'success'    => true,
-                'status'     => 'approved',
-                'message'    => 'Budget available. Request auto-approved — Supply Chain can now place the order.',
+                'status'     => 'pending',
+                'message'    => 'Request submitted. Waiting for Finance approval.',
                 'request_id' => $scRequestId,
             ]);
             exit();
@@ -281,7 +225,7 @@ try {
     }
 
     // ============================================
-    // PUT — update status (approve / order / receive)
+    // PUT — update status with flow enforcement
     // ============================================
     if ($method === 'PUT') {
         $id     = (int)($_GET['id'] ?? ($input['id'] ?? 0));
@@ -293,8 +237,8 @@ try {
             exit();
         }
 
-        // Allowed transitions
-        $allowed = ['pending', 'approved', 'ordered', 'received', 'cancelled'];
+        // Allowed statuses
+        $allowed = ['pending', 'approved', 'rejected', 'ordered', 'unavailable', 'received', 'paid'];
         if (!in_array($status, $allowed, true)) {
             http_response_code(400);
             echo json_encode(['success' => false, 'message' => "Invalid status: {$status}"]);
@@ -305,9 +249,11 @@ try {
         try {
             // Fetch current request
             $stmt = $conn->prepare("
-                SELECT r.*, p.name AS product_name
+                SELECT r.*, p.name AS product_name, p.id AS product_id,
+                       s.name AS supplier_name
                 FROM supply_chain_requests r
-                LEFT JOIN products p ON r.product_id = p.id
+                LEFT JOIN products  p ON r.product_id  = p.id
+                LEFT JOIN suppliers s ON r.supplier_id = s.id
                 WHERE r.id = ?
                 FOR UPDATE
             ");
@@ -318,14 +264,14 @@ try {
                 throw new Exception('Supply chain request not found');
             }
 
-            // Prevent duplicate receipt
+            // Prevent double-receive
             if ($status === 'received' && $req['status'] === 'received') {
                 $conn->commit();
                 echo json_encode(['success' => true, 'message' => 'Already received']);
                 exit();
             }
 
-            // Update the request row
+            // Update row
             $approvedBy = $input['approved_by'] ?? null;
             $newNotes   = trim((string)($input['notes'] ?? ''));
 
@@ -339,7 +285,9 @@ try {
             ");
             $stmt->execute([$status, $approvedBy, $newNotes, $status, $id]);
 
-            // If transitioning to "received", increase product stock
+            // === STATUS-SPECIFIC LOGIC ===
+
+            // 🔥 RECEIVED → increase product stock
             if ($status === 'received' && $req['status'] !== 'received') {
                 $stmt = $conn->prepare("
                     UPDATE products
@@ -360,7 +308,7 @@ try {
                 }
             }
 
-            // Notify on approval
+            // ✅ APPROVED → notify Supply Chain
             if ($status === 'approved' && $req['status'] === 'pending' && function_exists('notifyRole')) {
                 notifyRole(
                     $conn,
@@ -372,15 +320,51 @@ try {
                 );
             }
 
-            // Notify on order placed
+            // ❌ REJECTED → notify requester
+            if ($status === 'rejected' && function_exists('notifyRole')) {
+                createNotification(
+                    $conn,
+                    (int)$req['requested_by'],
+                    '❌ Request Rejected',
+                    "Your request for {$req['product_name']} × {$req['quantity']} was rejected by Finance.",
+                    'error',
+                    'error'
+                );
+            }
+
+            // 🚚 ORDERED → notify Finance
             if ($status === 'ordered' && function_exists('notifyRole')) {
                 notifyRole(
                     $conn,
                     ['finance', 'super_admin', 'admin'],
                     '🚚 Purchase Order Placed',
-                    "{$req['product_name']} × {$req['quantity']} ordered from supplier.",
+                    "{$req['product_name']} × {$req['quantity']} ordered from {$req['supplier_name']}.",
                     'info',
                     'info'
+                );
+            }
+
+            // ⚠️ UNAVAILABLE → notify requester
+            if ($status === 'unavailable' && function_exists('notifyRole')) {
+                createNotification(
+                    $conn,
+                    (int)$req['requested_by'],
+                    '⚠️ Request Unavailable',
+                    "Supplier has no stock for {$req['product_name']} × {$req['quantity']}. Please try again later.",
+                    'warning',
+                    'warning'
+                );
+            }
+
+            // 💰 PAID → notify
+            if ($status === 'paid' && function_exists('notifyRole')) {
+                notifyRole(
+                    $conn,
+                    ['supply_chain', 'super_admin', 'admin'],
+                    '💰 Supplier Paid',
+                    "Payment sent for {$req['product_name']} × {$req['quantity']} to {$req['supplier_name']}.",
+                    'success',
+                    'success'
                 );
             }
 
@@ -397,9 +381,6 @@ try {
         }
     }
 
-    // ============================================
-    // Unsupported method
-    // ============================================
     http_response_code(405);
     echo json_encode(['success' => false, 'message' => 'Method not allowed']);
 
