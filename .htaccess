@@ -1,0 +1,46 @@
+# ============================================
+# .htaccess — smart-pos-api root
+# ============================================
+
+RewriteEngine On
+RewriteBase /smart-pos-api/
+
+# ---------------------------------------------------------------
+# 1. NEVER rewrite /uploads/* — always serve static files directly
+# ---------------------------------------------------------------
+RewriteRule ^uploads/ - [L]
+
+# ---------------------------------------------------------------
+# 2. Serve any real file or directory directly (short-circuit)
+# ---------------------------------------------------------------
+RewriteCond %{REQUEST_FILENAME} -f [OR]
+RewriteCond %{REQUEST_FILENAME} -d
+RewriteRule ^ - [L]
+
+# ---------------------------------------------------------------
+# 3. Everything else → index.php (API router)
+# ---------------------------------------------------------------
+RewriteRule ^(.*)$ index.php?endpoint=$1 [QSA,L]
+
+# ============================================
+# CORS headers
+# ============================================
+<IfModule mod_headers.c>
+    Header set Access-Control-Allow-Origin "*"
+    Header set Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS"
+    Header set Access-Control-Allow-Headers "Content-Type, Authorization, X-Requested-With"
+    Header set Access-Control-Allow-Credentials "true"
+</IfModule>
+
+# ============================================
+# Explicitly allow image files (safety net)
+# ============================================
+<FilesMatch "\.(jpg|jpeg|png|gif|webp|svg|ico|bmp)$">
+    <IfModule mod_authz_core.c>
+        Require all granted
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Allow from all
+    </IfModule>
+</FilesMatch>
