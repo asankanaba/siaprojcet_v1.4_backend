@@ -1,8 +1,4 @@
 /vendor/
 /logs/
 /uploads/
-.git/
-.vscode/
-node_modules/
-*.log
 .env

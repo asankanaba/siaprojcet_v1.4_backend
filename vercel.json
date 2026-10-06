@@ -7,14 +7,6 @@
   },
   "routes": [
     {
-      "src": "/api/(.*\\.php)",
-      "dest": "/api/index.php?endpoint=$1"
-    },
-    {
-      "src": "/api/(.*)",
-      "dest": "/api/index.php?endpoint=$1"
-    },
-    {
       "src": "/(.*)",
       "dest": "/api/index.php"
     }
