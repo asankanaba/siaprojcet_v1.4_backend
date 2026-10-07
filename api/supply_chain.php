@@ -4,13 +4,13 @@
 // 🔧 Supply Chain Requests Flow (7 statuses)
 //
 // FLOW:
-//   pending    → Staff creates request
-//   approved   → Finance approves budget
-//   rejected   → Finance denies budget
-//   ordered    → Supply Chain placed order with supplier
-//   unavailable→ Supplier has no stock
-//   received   → Goods arrived, stock++
-//   paid       → Finance paid supplier via PayMongo
+//   pending     → Staff creates request
+//   approved    → Finance approves budget (or auto-approved from product request)
+//   rejected    → Finance denies budget
+//   ordered     → Supply Chain placed order with supplier (supplier_id set here)
+//   unavailable → Supplier has no stock
+//   received    → Goods arrived, stock++ (via po_deliveries OR direct)
+//   paid        → Finance paid supplier via PayMongo
 // ============================================
 
 header('Content-Type: application/json');
@@ -38,12 +38,11 @@ try {
     // ============================================
     if ($method === 'GET') {
 
-        // --- Product stock check ---
+        // Product stock check
         if (isset($_GET['product_id'])) {
             $stmt = $conn->prepare("
                 SELECT id, name, stock, low_stock_threshold
-                FROM products
-                WHERE id = ?
+                FROM products WHERE id = ?
             ");
             $stmt->execute([(int)$_GET['product_id']]);
             $product = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -59,15 +58,15 @@ try {
             echo json_encode([
                 'success' => true,
                 'data' => [
-                    'product' => $product,
+                    'product'       => $product,
                     'needs_restock' => $needsRestock,
-                    'stock_status' => $needsRestock ? 'low' : 'adequate',
+                    'stock_status'  => $needsRestock ? 'low' : 'adequate',
                 ],
             ]);
             exit();
         }
 
-        // --- Low stock list ---
+        // Low stock list
         if (isset($_GET['low_stock'])) {
             $stmt = $conn->prepare("
                 SELECT p.*, s.id AS supplier_id, s.name AS supplier_name,
@@ -82,7 +81,7 @@ try {
             exit();
         }
 
-        // --- Single request ---
+        // Single request
         if (isset($_GET['id'])) {
             $stmt = $conn->prepare("
                 SELECT r.*,
@@ -108,7 +107,7 @@ try {
             exit();
         }
 
-        // --- List all requests ---
+        // List all requests
         $stmt = $conn->prepare("
             SELECT r.*,
                    p.name AS product_name,
@@ -130,7 +129,7 @@ try {
     }
 
     // ============================================
-    // POST — Staff creates a request
+    // POST — Staff creates a restock request
     // ============================================
     if ($method === 'POST') {
         $productId   = (int)($input['product_id']   ?? 0);
@@ -146,16 +145,12 @@ try {
 
         $conn->beginTransaction();
         try {
-            // Fetch product
             $stmt = $conn->prepare("SELECT id, name, stock, cost, low_stock_threshold FROM products WHERE id = ?");
             $stmt->execute([$productId]);
             $product = $stmt->fetch(PDO::FETCH_ASSOC);
+            if (!$product) throw new Exception('Product not found');
 
-            if (!$product) {
-                throw new Exception('Product not found');
-            }
-
-            // If stock is sufficient, no restock needed
+            // Stock is sufficient → no request needed
             if ((int)$product['stock'] >= $quantity) {
                 $conn->commit();
                 echo json_encode([
@@ -167,7 +162,7 @@ try {
                 exit();
             }
 
-            // Find a supplier for this product
+            // Find supplier for this product (auto-pick cheapest by default — Supply Chain can override later)
             $stmt = $conn->prepare("
                 SELECT id, name, stock_available, price_per_unit, lead_time_days
                 FROM suppliers
@@ -181,7 +176,6 @@ try {
             $unitPrice = $supplier['price_per_unit'] ?? ($product['cost'] ?? 0);
             $finalCost = $unitPrice * $quantity;
 
-            // Create request with status = pending (waits for Finance)
             $stmt = $conn->prepare("
                 INSERT INTO supply_chain_requests
                     (product_id, supplier_id, quantity, status, requested_by, total_cost, notes, created_at)
@@ -197,7 +191,6 @@ try {
             ]);
             $scRequestId = (int)$conn->lastInsertId();
 
-            // Notify Finance
             if (function_exists('notifyRole')) {
                 notifyRole(
                     $conn,
@@ -225,7 +218,8 @@ try {
     }
 
     // ============================================
-    // PUT — update status with flow enforcement
+    // PUT — Update status
+    // Accepts supplier_id when status = 'ordered'
     // ============================================
     if ($method === 'PUT') {
         $id     = (int)($_GET['id'] ?? ($input['id'] ?? 0));
@@ -237,7 +231,6 @@ try {
             exit();
         }
 
-        // Allowed statuses
         $allowed = ['pending', 'approved', 'rejected', 'ordered', 'unavailable', 'received', 'paid'];
         if (!in_array($status, $allowed, true)) {
             http_response_code(400);
@@ -247,7 +240,6 @@ try {
 
         $conn->beginTransaction();
         try {
-            // Fetch current request
             $stmt = $conn->prepare("
                 SELECT r.*, p.name AS product_name, p.id AS product_id,
                        s.name AS supplier_name
@@ -260,40 +252,72 @@ try {
             $stmt->execute([$id]);
             $req = $stmt->fetch(PDO::FETCH_ASSOC);
 
-            if (!$req) {
-                throw new Exception('Supply chain request not found');
-            }
+            if (!$req) throw new Exception('Supply chain request not found');
 
-            // Prevent double-receive
             if ($status === 'received' && $req['status'] === 'received') {
                 $conn->commit();
                 echo json_encode(['success' => true, 'message' => 'Already received']);
                 exit();
             }
 
-            // Update row
-            $approvedBy = $input['approved_by'] ?? null;
-            $newNotes   = trim((string)($input['notes'] ?? ''));
+            $approvedBy   = $input['approved_by'] ?? null;
+            $newNotes     = trim((string)($input['notes'] ?? ''));
+            $newSupplier  = isset($input['supplier_id']) ? (int)$input['supplier_id'] : null;
+            $newQuantity  = isset($input['quantity'])    ? (int)$input['quantity']    : null;
 
-            $stmt = $conn->prepare("
-                UPDATE supply_chain_requests
-                SET status       = ?,
-                    approved_by  = COALESCE(?, approved_by),
-                    notes        = CONCAT(COALESCE(notes, ''), ' ', ?),
-                    received_date = IF(? = 'received', NOW(), received_date)
-                WHERE id = ?
-            ");
-            $stmt->execute([$status, $approvedBy, $newNotes, $status, $id]);
+            // If ordering → supplier_id is required
+            if ($status === 'ordered' && !$newSupplier && !$req['supplier_id']) {
+                throw new Exception('Please select a supplier before ordering.');
+            }
 
-            // === STATUS-SPECIFIC LOGIC ===
+            // Build dynamic update
+            $fields = [
+                'status = :status',
+                'approved_by = COALESCE(:approved_by, approved_by)',
+                "notes = CONCAT(COALESCE(notes, ''), ' ', :notes)",
+                "received_date = IF(:status_check = 'received', NOW(), received_date)"
+            ];
+            $params = [
+                ':status'        => $status,
+                ':approved_by'   => $approvedBy,
+                ':notes'         => $newNotes,
+                ':status_check'  => $status,
+                ':id'            => $id,
+            ];
 
-            // 🔥 RECEIVED → increase product stock
+            if ($newSupplier) {
+                $fields[] = 'supplier_id = :supplier_id';
+                $params[':supplier_id'] = $newSupplier;
+            }
+            if ($newQuantity && $newQuantity > 0) {
+                $fields[] = 'quantity = :quantity';
+                $params[':quantity'] = $newQuantity;
+            }
+
+            // Recalculate total_cost when ordering
+            if ($status === 'ordered') {
+                $sid = $newSupplier ?: $req['supplier_id'];
+                if ($sid) {
+                    $sStmt = $conn->prepare("SELECT price_per_unit FROM suppliers WHERE id = ?");
+                    $sStmt->execute([$sid]);
+                    $sp = $sStmt->fetch(PDO::FETCH_ASSOC);
+                    $unitPrice = (float)($sp['price_per_unit'] ?? 0);
+                    $qty       = $newQuantity ?: (int)$req['quantity'];
+                    $fields[]  = 'total_cost = :total_cost';
+                    $params[':total_cost'] = $unitPrice * $qty;
+                }
+            }
+
+            $sql = "UPDATE supply_chain_requests SET " . implode(', ', $fields) . " WHERE id = :id";
+            $stmt = $conn->prepare($sql);
+            foreach ($params as $k => $v) $stmt->bindValue($k, $v);
+            $stmt->execute();
+
+            // STATUS-SPECIFIC LOGIC
+
+            // 🔥 RECEIVED → increase product stock (ONCE)
             if ($status === 'received' && $req['status'] !== 'received') {
-                $stmt = $conn->prepare("
-                    UPDATE products
-                    SET stock = stock + ?
-                    WHERE id = ?
-                ");
+                $stmt = $conn->prepare("UPDATE products SET stock = stock + ? WHERE id = ?");
                 $stmt->execute([(int)$req['quantity'], (int)$req['product_id']]);
 
                 if (function_exists('notifyRole')) {
@@ -321,12 +345,13 @@ try {
             }
 
             // ❌ REJECTED → notify requester
-            if ($status === 'rejected' && function_exists('notifyRole')) {
+            if ($status === 'rejected' && function_exists('createNotification')) {
                 createNotification(
                     $conn,
                     (int)$req['requested_by'],
                     '❌ Request Rejected',
-                    "Your request for {$req['product_name']} × {$req['quantity']} was rejected by Finance.",
+                    "Your request for {$req['product_name']} × {$req['quantity']} was rejected by Finance." .
+                    ($newNotes ? " Reason: {$newNotes}" : ''),
                     'error',
                     'error'
                 );
@@ -334,18 +359,24 @@ try {
 
             // 🚚 ORDERED → notify Finance
             if ($status === 'ordered' && function_exists('notifyRole')) {
+                $supplierName = $req['supplier_name'] ?? 'selected supplier';
+                if ($newSupplier) {
+                    $sStmt = $conn->prepare("SELECT name FROM suppliers WHERE id = ?");
+                    $sStmt->execute([$newSupplier]);
+                    $supplierName = $sStmt->fetchColumn() ?: $supplierName;
+                }
                 notifyRole(
                     $conn,
                     ['finance', 'super_admin', 'admin'],
                     '🚚 Purchase Order Placed',
-                    "{$req['product_name']} × {$req['quantity']} ordered from {$req['supplier_name']}.",
+                    "{$req['product_name']} × {$req['quantity']} ordered from {$supplierName}.",
                     'info',
                     'info'
                 );
             }
 
             // ⚠️ UNAVAILABLE → notify requester
-            if ($status === 'unavailable' && function_exists('notifyRole')) {
+            if ($status === 'unavailable' && function_exists('createNotification')) {
                 createNotification(
                     $conn,
                     (int)$req['requested_by'],
@@ -356,13 +387,13 @@ try {
                 );
             }
 
-            // 💰 PAID → notify
+            // 💰 PAID → notify Supply Chain
             if ($status === 'paid' && function_exists('notifyRole')) {
                 notifyRole(
                     $conn,
                     ['supply_chain', 'super_admin', 'admin'],
                     '💰 Supplier Paid',
-                    "Payment sent for {$req['product_name']} × {$req['quantity']} to {$req['supplier_name']}.",
+                    "Payment sent for {$req['product_name']} × {$req['quantity']}.",
                     'success',
                     'success'
                 );

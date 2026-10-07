@@ -1,5 +1,5 @@
 <?php
-// api/supplier_invoices.php — Invoice entry + 3-way match
+// api/supplier_invoices.php — Invoice entry + STRICT 3-way match
 header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST, PUT, OPTIONS');
@@ -7,7 +7,7 @@ header('Access-Control-Allow-Headers: Content-Type, Authorization');
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit(); }
 
-require_once __DIR__ . '/../config/database.php';   // ← FIXED
+require_once __DIR__ . '/../config/database.php';
 
 $method = $_SERVER['REQUEST_METHOD'];
 $input  = json_decode(file_get_contents('php://input'), true) ?: [];
@@ -53,7 +53,7 @@ try {
             ";
             $where = []; $params = [];
             if (!empty($_GET['status'])) { $where[] = "i.status = ?"; $params[] = $_GET['status']; }
-            if (!empty($_GET['po_id']))  { $where[] = "i.po_id = ?"; $params[] = $_GET['po_id']; }
+            if (!empty($_GET['po_id']))  { $where[] = "i.po_id = ?";  $params[] = $_GET['po_id']; }
             if ($where) $sql .= " WHERE " . implode(" AND ", $where);
             $sql .= " ORDER BY i.created_at DESC";
 
@@ -63,9 +63,45 @@ try {
             break;
 
         // ============================================
-        // POST — record invoice + auto 3-way match
+        // POST — record invoice + strict 3-way match
         // ============================================
         case 'POST':
+            // --- ACTION: mark_paid (called after PayMongo succeeds) ---
+            if (($input['action'] ?? '') === 'mark_paid') {
+                $invId = (int)($input['invoice_id'] ?? 0);
+                $payId = (int)($input['payment_id'] ?? 0);
+                if ($invId <= 0) throw new Exception('invoice_id required');
+
+                // Guard: only matched invoices can be marked paid
+                $chk = $conn->prepare("SELECT status FROM supplier_invoices WHERE id = ?");
+                $chk->execute([$invId]);
+                $row = $chk->fetch(PDO::FETCH_ASSOC);
+                if (!$row) throw new Exception('Invoice not found');
+                if ($row['status'] !== 'matched') {
+                    throw new Exception('Cannot pay — invoice 3-way match has not passed.');
+                }
+
+                $upd = $conn->prepare("
+                    UPDATE supplier_invoices
+                    SET status = 'paid', paid_at = NOW(), payment_id = ?
+                    WHERE id = ? AND status = 'matched'
+                ");
+                $upd->execute([$payId ?: null, $invId]);
+
+                // Also update the linked PO lifecycle
+                $poStmt = $conn->prepare("
+                    UPDATE purchase_orders po
+                    JOIN supplier_invoices i ON i.po_id = po.id
+                    SET po.lifecycle_status = 'paid'
+                    WHERE i.id = ?
+                ");
+                $poStmt->execute([$invId]);
+
+                echo json_encode(['success' => true, 'message' => 'Invoice marked paid']);
+                break;
+            }
+
+            // --- Normal invoice creation ---
             $required = ['invoice_number','po_id','supplier_id','invoice_date','subtotal','total'];
             foreach ($required as $f) {
                 if (empty($input[$f]) && $input[$f] !== 0) throw new Exception("Missing required field: $f");
@@ -73,7 +109,6 @@ try {
 
             $poId = (int)$input['po_id'];
 
-            // Fetch PO
             $stmt = $conn->prepare("
                 SELECT po.*, p.name AS product_name FROM purchase_orders po
                 LEFT JOIN products p ON po.product_id = p.id
@@ -83,7 +118,7 @@ try {
             $po = $stmt->fetch(PDO::FETCH_ASSOC);
             if (!$po) throw new Exception('PO not found');
 
-            // Fetch total received
+            // Total received
             $stmt = $conn->prepare("
                 SELECT COALESCE(SUM(qty_received),0) AS total_received
                 FROM po_deliveries WHERE po_id = ?
@@ -129,7 +164,6 @@ try {
 
             $invId = $conn->lastInsertId();
 
-            // Update PO lifecycle if matched
             if ($matchOK) {
                 $stmt = $conn->prepare("
                     UPDATE purchase_orders
@@ -139,15 +173,16 @@ try {
                 $stmt->execute([$poId]);
             }
 
-            // Notify finance
-            notifyRole(
-                $conn,
-                ['finance','super_admin','admin'],
-                ($matchOK ? '✅ Invoice Matched' : '⚠️ Invoice Mismatch') . ' — ' . $input['invoice_number'],
-                'PO ' . $po['po_number'] . '. ' . implode(' | ', $matchNotes),
-                $matchOK ? 'success' : 'warning',
-                $matchOK ? 'success' : 'warning'
-            );
+            if (function_exists('notifyRole')) {
+                notifyRole(
+                    $conn,
+                    ['finance','super_admin','admin'],
+                    ($matchOK ? '✅ Invoice Matched' : '⚠️ Invoice Mismatch') . ' — ' . $input['invoice_number'],
+                    'PO ' . $po['po_number'] . '. ' . implode(' | ', $matchNotes),
+                    $matchOK ? 'success' : 'warning',
+                    $matchOK ? 'success' : 'warning'
+                );
+            }
 
             echo json_encode([
                 'success' => true,
@@ -158,13 +193,28 @@ try {
             ]);
             break;
 
+        // ============================================
+        // PUT — update invoice fields
+        // ============================================
         case 'PUT':
             $id = $_GET['id'] ?? null;
             if (!$id) throw new Exception('ID required');
-            $allowed = ['status','match_notes','matched_by','due_date'];
+
+            // Block status change to 'paid' unless current status is 'matched'
+            if (($input['status'] ?? '') === 'paid') {
+                $chk = $conn->prepare("SELECT status FROM supplier_invoices WHERE id = ?");
+                $chk->execute([$id]);
+                $row = $chk->fetch(PDO::FETCH_ASSOC);
+                if (!$row) throw new Exception('Invoice not found');
+                if ($row['status'] !== 'matched') {
+                    throw new Exception('Cannot mark as paid — 3-way match has not passed.');
+                }
+            }
+
+            $allowed = ['status','match_notes','matched_by','due_date','paid_at','payment_id'];
             $fields = []; $params = [];
             foreach ($allowed as $f) {
-                if (isset($input[$f])) { $fields[] = "$f = ?"; $params[] = $input[$f]; }
+                if (array_key_exists($f, $input)) { $fields[] = "$f = ?"; $params[] = $input[$f]; }
             }
             if (!$fields) throw new Exception('No fields to update');
             $params[] = $id;
@@ -177,3 +227,4 @@ try {
     http_response_code(400);
     echo json_encode(['success' => false, 'message' => $e->getMessage()]);
 }
+?>
