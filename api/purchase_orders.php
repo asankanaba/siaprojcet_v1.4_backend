@@ -2,6 +2,7 @@
 // ============================================================
 // 📁 File: api/purchase_orders.php
 // 📦 Purchase Orders API — Phase 3 (payment-aware)
+// 🔧 + actions: pay, close, record_grn
 // ============================================================
 declare(strict_types=1);
 
@@ -20,36 +21,23 @@ $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 $input  = json_decode(file_get_contents('php://input'), true) ?: [];
 
 // ------------------------------------------------------------
-// Helper: current user (from JWT / session / body)
+// Helpers
 // ------------------------------------------------------------
 function po_current_user(array $body): ?array {
-    $u = getAuthUser();              // from config/database.php
+    $u = getAuthUser();
     if ($u && !empty($u['id'])) return $u;
 
-    if (!empty($body['ordered_by'])) {
-        return ['id' => (int)$body['ordered_by'], 'role' => null];
-    }
-    if (!empty($_GET['ordered_by'])) {
-        return ['id' => (int)$_GET['ordered_by'], 'role' => null];
-    }
+    if (!empty($body['ordered_by'])) return ['id' => (int)$body['ordered_by'], 'role' => null];
+    if (!empty($_GET['ordered_by'])) return ['id' => (int)$_GET['ordered_by'], 'role' => null];
     return null;
 }
 
-// ------------------------------------------------------------
-// Helper: which lifecycle states can be paid?
-// ------------------------------------------------------------
 function po_is_payable(string $lifecycle, string $status): bool {
-    // Payment is allowed once goods have been received or matched
-    $ok_states = ['grn_posted', 'invoiced', 'matched'];
-    $ok_statuses = ['received'];   // fall back to simple status column
-
-    return in_array($lifecycle, $ok_states, true)
-        || in_array($status, $ok_statuses, true);
+    $ok_states   = ['grn_posted', 'invoiced', 'matched'];
+    $ok_statuses = ['received'];
+    return in_array($lifecycle, $ok_states, true) || in_array($status, $ok_statuses, true);
 }
 
-// ------------------------------------------------------------
-// Helper: compute days past due from expected_delivery
-// ------------------------------------------------------------
 function po_days_overdue(?string $expected, string $payment_status): int {
     if (!$expected) return 0;
     if (in_array($payment_status, ['paid','partial'], true)) return 0;
@@ -67,7 +55,6 @@ try {
         // ============================================================
         case 'GET':
 
-            // ---------- ?action=summary ----------
             if (($_GET['action'] ?? '') === 'summary') {
                 $row = $conn->query("
                     SELECT
@@ -88,7 +75,6 @@ try {
                 respond_json(['success' => true, 'data' => $row]);
             }
 
-            // ---------- ?action=eligible_for_payment ----------
             if (($_GET['action'] ?? '') === 'eligible_for_payment') {
                 $stmt = $conn->query("
                     SELECT po.*, s.name AS supplier_name, p.name AS product_name
@@ -106,7 +92,6 @@ try {
                 respond_json(['success' => true, 'data' => $rows]);
             }
 
-            // ---------- ?action=payment_history&po_id=N ----------
             if (($_GET['action'] ?? '') === 'payment_history') {
                 $po_id = (int)($_GET['po_id'] ?? 0);
                 if (!$po_id) throw new InvalidArgumentException('po_id required');
@@ -122,7 +107,6 @@ try {
                 respond_json(['success' => true, 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
             }
 
-            // ---------- ?action=stats&days=N (spend trend) ----------
             if (($_GET['action'] ?? '') === 'stats') {
                 $days = max(7, min(365, (int)($_GET['days'] ?? 30)));
                 $stmt = $conn->prepare("
@@ -138,16 +122,17 @@ try {
                 respond_json(['success' => true, 'data' => $stmt->fetchAll(PDO::FETCH_ASSOC)]);
             }
 
-            // ---------- GET ?id=N (single PO) ----------
             if (isset($_GET['id'])) {
                 $stmt = $conn->prepare("
                     SELECT po.*, p.name AS product_name, p.price AS product_price,
                            s.name AS supplier_name, s.contact_person, s.phone AS supplier_phone,
-                           u.full_name AS ordered_by_name
+                           u.full_name AS ordered_by_name,
+                           c.full_name AS closed_by_name
                     FROM purchase_orders po
                     LEFT JOIN products  p ON po.product_id  = p.id
                     LEFT JOIN suppliers s ON po.supplier_id = s.id
                     LEFT JOIN users     u ON po.ordered_by  = u.id
+                    LEFT JOIN users     c ON po.closed_by   = c.id
                     WHERE po.id = ?
                 ");
                 $stmt->execute([(int)$_GET['id']]);
@@ -156,7 +141,6 @@ try {
 
                 $po = po_enrich($po);
 
-                // Attach payment history
                 $ph = $conn->prepare("
                     SELECT p.*, u.full_name AS paid_by_name
                     FROM payments p
@@ -167,7 +151,6 @@ try {
                 $ph->execute([$po['id']]);
                 $po['payments'] = $ph->fetchAll(PDO::FETCH_ASSOC);
 
-                // Attach deliveries (GRN)
                 $dl = $conn->prepare("
                     SELECT d.*, u.full_name AS received_by_name
                     FROM po_deliveries d
@@ -178,7 +161,6 @@ try {
                 $dl->execute([$po['id']]);
                 $po['deliveries'] = $dl->fetchAll(PDO::FETCH_ASSOC);
 
-                // Attach supplier invoice
                 $iv = $conn->prepare("
                     SELECT * FROM supplier_invoices WHERE po_id = ? ORDER BY created_at DESC LIMIT 1
                 ");
@@ -188,7 +170,6 @@ try {
                 respond_json(['success' => true, 'data' => $po]);
             }
 
-            // ---------- GET list (with filters + enrichment) ----------
             $sql = "
                 SELECT po.*, p.name AS product_name, s.name AS supplier_name,
                        u.full_name AS ordered_by_name
@@ -201,27 +182,17 @@ try {
             $conditions = [];
             $params     = [];
 
-            // String filters
             foreach (['status','payment_status','lifecycle_status'] as $f) {
-                if (!empty($_GET[$f])) {
-                    $conditions[] = "po.$f = ?";
-                    $params[]     = $_GET[$f];
-                }
+                if (!empty($_GET[$f])) { $conditions[] = "po.$f = ?"; $params[] = $_GET[$f]; }
             }
-            // Numeric filters
             foreach (['supplier_id','product_id','requisition_id'] as $f) {
-                if (!empty($_GET[$f])) {
-                    $conditions[] = "po.$f = ?";
-                    $params[]     = (int)$_GET[$f];
-                }
+                if (!empty($_GET[$f])) { $conditions[] = "po.$f = ?"; $params[] = (int)$_GET[$f]; }
             }
-            // Date range
             if (!empty($_GET['date_from']) && !empty($_GET['date_to'])) {
                 $conditions[] = "po.ordered_date BETWEEN ? AND ?";
                 $params[]     = $_GET['date_from'] . ' 00:00:00';
                 $params[]     = $_GET['date_to']   . ' 23:59:59';
             }
-            // Free-text search (PO number / product / supplier)
             if (!empty($_GET['q'])) {
                 $conditions[] = "(po.po_number LIKE ? OR p.name LIKE ? OR s.name LIKE ?)";
                 $like = '%' . $_GET['q'] . '%';
@@ -230,7 +201,6 @@ try {
 
             if ($conditions) $sql .= ' WHERE ' . implode(' AND ', $conditions);
 
-            // Sort
             $sortable = ['po_number','ordered_date','total_cost','expected_delivery','payment_status','id'];
             $sortBy   = in_array($_GET['sort_by'] ?? '', $sortable, true) ? $_GET['sort_by'] : 'created_at';
             $sortDir  = strtoupper($_GET['sort_dir'] ?? 'DESC') === 'ASC' ? 'ASC' : 'DESC';
@@ -239,17 +209,261 @@ try {
             $stmt = $conn->prepare($sql);
             $stmt->execute($params);
             $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
-
             $rows = array_map('po_enrich', $rows);
             respond_json(['success' => true, 'data' => $rows]);
             break;
 
 
         // ============================================================
-        // POST — create
+        // POST
         // ============================================================
         case 'POST':
             $user = po_current_user($input);
+
+            // ========================================================
+            // ACTION: pay
+            // ========================================================
+            if (($_GET['action'] ?? '') === 'pay') {
+                $po_id = (int)($input['po_id'] ?? 0);
+                if ($po_id <= 0) throw new InvalidArgumentException('po_id required');
+
+                $method = trim((string)($input['payment_method'] ?? 'paymongo'));
+                $ref    = trim((string)($input['payment_reference'] ?? ''));
+                $amount = (float)($input['amount'] ?? 0);
+                $paidBy = $user['id'] ?? (int)($input['paid_by'] ?? 0);
+
+                $conn->beginTransaction();
+                try {
+                    $p = $conn->prepare("
+                        SELECT id, po_number, total_cost, amount_paid, status,
+                               lifecycle_status, payment_status, supplier_id
+                        FROM purchase_orders WHERE id = ? FOR UPDATE
+                    ");
+                    $p->execute([$po_id]);
+                    $po = $p->fetch(PDO::FETCH_ASSOC);
+                    if (!$po) throw new InvalidArgumentException('PO not found');
+
+                    if ($po['status'] === 'cancelled') {
+                        throw new InvalidArgumentException('Cannot pay a cancelled PO');
+                    }
+                    if (!po_is_payable($po['lifecycle_status'], $po['status'])) {
+                        throw new InvalidArgumentException('Cannot pay before goods are received');
+                    }
+
+                    $total   = (float)$po['total_cost'];
+                    $already = (float)$po['amount_paid'];
+                    $pay     = $amount > 0 ? $amount : ($total - $already);
+
+                    if ($pay <= 0) throw new InvalidArgumentException('Nothing left to pay');
+                    if ($already + $pay > $total + 0.01) {
+                        throw new InvalidArgumentException('Payment would exceed total amount');
+                    }
+
+                    $newPaid      = round($already + $pay, 2);
+                    $newStatus    = ($newPaid >= $total - 0.01) ? 'paid' : 'partial';
+                    $newLifecycle = ($newStatus === 'paid') ? 'paid' : $po['lifecycle_status'];
+
+                    $ins = $conn->prepare("
+                        INSERT INTO payments
+                            (po_id, supplier_id, amount, payment_method, payment_reference,
+                             status, paid_by, paid_at, created_at, currency, method)
+                        VALUES
+                            (:po, :sid, :amt, :pm, :ref,
+                             'succeeded', :by, NOW(), NOW(), 'PHP', 'paymongo')
+                    ");
+                    $ins->execute([
+                        ':po'  => $po_id,
+                        ':sid' => (int)$po['supplier_id'],
+                        ':amt' => $pay,
+                        ':pm'  => $method,
+                        ':ref' => $ref,
+                        ':by'  => $paidBy ?: null,
+                    ]);
+                    $paymentId = (int)$conn->lastInsertId();
+
+                    $upd = $conn->prepare("
+                        UPDATE purchase_orders
+                        SET payment_status    = ?,
+                            payment_method    = ?,
+                            payment_reference = ?,
+                            amount_paid       = ?,
+                            lifecycle_status  = ?,
+                            updated_at        = NOW()
+                        WHERE id = ?
+                    ");
+                    $upd->execute([$newStatus, $method, $ref, $newPaid, $newLifecycle, $po_id]);
+
+                    if ($newStatus === 'paid') {
+                        $conn->prepare("
+                            UPDATE supply_chain_requests r
+                            JOIN purchase_orders po ON po.requisition_id = r.id
+                            SET r.status = 'paid', r.paid_by = ?, r.paid_at = NOW(), r.updated_at = NOW()
+                            WHERE po.id = ?
+                        ")->execute([$paidBy ?: null, $po_id]);
+                    }
+
+                    $conn->commit();
+
+                    if (function_exists('notifyRole')) {
+                        notifyRole(
+                            $conn,
+                            ['finance', 'supply_chain', 'super_admin', 'admin'],
+                            '💰 Payment Recorded — ' . $po['po_number'],
+                            'Paid ₱' . number_format($pay, 2) . ' via ' . $method,
+                            'success', 'success'
+                        );
+                    }
+
+                    respond_json([
+                        'success'        => true,
+                        'payment_id'     => $paymentId,
+                        'payment_status' => $newStatus,
+                        'amount_paid'    => $newPaid,
+                        'balance_due'    => number_format(max(0, $total - $newPaid), 2, '.', ''),
+                    ]);
+
+                } catch (Throwable $e) {
+                    $conn->rollBack();
+                    throw $e;
+                }
+            }
+
+            // ========================================================
+            // ACTION: close
+            // ========================================================
+            if (($_GET['action'] ?? '') === 'close') {
+                $po_id = (int)($input['po_id'] ?? 0);
+                if ($po_id <= 0) throw new InvalidArgumentException('po_id required');
+
+                $closedBy = $user['id'] ?? (int)($input['closed_by'] ?? 0);
+
+                $chk = $conn->prepare("
+                    SELECT po_number, lifecycle_status, payment_status
+                    FROM purchase_orders WHERE id = ?
+                ");
+                $chk->execute([$po_id]);
+                $po = $chk->fetch(PDO::FETCH_ASSOC);
+                if (!$po) throw new InvalidArgumentException('PO not found');
+
+                if ($po['payment_status'] !== 'paid') {
+                    throw new InvalidArgumentException('Cannot close a PO that is not fully paid');
+                }
+
+                $upd = $conn->prepare("
+                    UPDATE purchase_orders
+                    SET lifecycle_status = 'closed',
+                        closed_at        = NOW(),
+                        closed_by        = ?,
+                        updated_at       = NOW()
+                    WHERE id = ?
+                ");
+                $upd->execute([$closedBy ?: null, $po_id]);
+
+                $conn->prepare("
+                    UPDATE supply_chain_requests r
+                    JOIN purchase_orders po ON po.requisition_id = r.id
+                    SET r.status = 'completed', r.updated_at = NOW()
+                    WHERE po.id = ?
+                ")->execute([$po_id]);
+
+                respond_json(['success' => true, 'message' => 'PO closed']);
+            }
+
+            // ========================================================
+            // ACTION: record_grn
+            // ========================================================
+            if (($_GET['action'] ?? '') === 'record_grn') {
+                $po_id  = (int)($input['po_id'] ?? 0);
+                $qty    = (int)($input['qty_received'] ?? 0);
+                $recvBy = $user['id'] ?? (int)($input['received_by'] ?? 0);
+                $notes  = trim((string)($input['condition_notes'] ?? ''));
+
+                if ($po_id <= 0 || $qty <= 0) {
+                    throw new InvalidArgumentException('po_id and qty_received required');
+                }
+                if ($recvBy <= 0) throw new InvalidArgumentException('received_by or authenticated user required');
+
+                $conn->beginTransaction();
+                try {
+                    $p = $conn->prepare("
+                        SELECT id, po_number, product_id, quantity, lifecycle_status, status
+                        FROM purchase_orders WHERE id = ? FOR UPDATE
+                    ");
+                    $p->execute([$po_id]);
+                    $po = $p->fetch(PDO::FETCH_ASSOC);
+                    if (!$po) throw new InvalidArgumentException('PO not found');
+
+                    if (in_array($po['lifecycle_status'], ['paid','closed','cancelled'], true)) {
+                        throw new InvalidArgumentException('Cannot receive a ' . $po['lifecycle_status'] . ' PO');
+                    }
+
+                    $grnNumber = 'GRN-' . date('Ymd') . '-' . rand(1000, 9999);
+                    $status    = ($qty >= (int)$po['quantity']) ? 'complete' : 'partial';
+
+                    $g = $conn->prepare("
+                        INSERT INTO po_deliveries
+                            (po_id, grn_number, received_by, qty_ordered,
+                             qty_received, qty_rejected, condition_notes, status)
+                        VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+                    ");
+                    $g->execute([$po_id, $grnNumber, $recvBy, (int)$po['quantity'], $qty, $notes, $status]);
+                    $grnId = (int)$conn->lastInsertId();
+
+                    $conn->prepare("
+                        UPDATE purchase_orders
+                        SET lifecycle_status = 'grn_posted', status = 'received',
+                            received_date = NOW(), updated_at = NOW()
+                        WHERE id = ?
+                    ")->execute([$po_id]);
+
+                    $conn->prepare("UPDATE products SET stock = stock + ? WHERE id = ?")
+                         ->execute([$qty, (int)$po['product_id']]);
+
+                    try {
+                        $conn->prepare("
+                            INSERT INTO inventory_logs (product_id, quantity_change, type, note, user_id)
+                            VALUES (?, ?, 'restock', ?, ?)
+                        ")->execute([
+                            (int)$po['product_id'], $qty,
+                            "GRN {$grnNumber} for PO {$po['po_number']}",
+                            $recvBy,
+                        ]);
+                    } catch (Throwable $ignored) {}
+
+                    $conn->prepare("
+                        UPDATE supply_chain_requests r
+                        JOIN purchase_orders po ON po.requisition_id = r.id
+                        SET r.status = 'received',
+                            r.received_by = ?, r.received_at = NOW(), r.received_date = NOW(),
+                            r.updated_at = NOW()
+                        WHERE po.id = ?
+                    ")->execute([$recvBy, $po_id]);
+
+                    $conn->commit();
+
+                    if (function_exists('notifyRole')) {
+                        notifyRole(
+                            $conn,
+                            ['finance', 'supply_chain', 'super_admin', 'admin'],
+                            '📦 Delivery Received — ' . $po['po_number'],
+                            $qty . ' of ' . $po['quantity'] . ' units received. GRN ' . $grnNumber,
+                            'info', 'info'
+                        );
+                    }
+
+                    respond_json([
+                        'success'    => true,
+                        'grn_id'     => $grnId,
+                        'grn_number' => $grnNumber,
+                        'status'     => $status,
+                    ]);
+                } catch (Throwable $e) {
+                    $conn->rollBack();
+                    throw $e;
+                }
+            }
+
+            // ---- default: create ----
             $required = ['product_id','supplier_id','quantity','unit_price'];
             foreach ($required as $f) {
                 if (empty($input[$f])) throw new InvalidArgumentException("Missing required field: $f");
@@ -290,19 +504,16 @@ try {
                 ]);
                 $orderId = (int)$conn->lastInsertId();
 
-                // Decrement supplier stock (kept from original)
                 $conn->prepare("UPDATE suppliers SET stock_available = stock_available - ? WHERE id = ?")
                      ->execute([$quantity, (int)$input['supplier_id']]);
 
-                // Notify finance + supply chain
                 if (function_exists('notifyRole')) {
                     notifyRole(
                         $conn,
                         ['finance','supply_chain','super_admin','admin'],
                         '📦 New Purchase Order — ' . $po_number,
                         'PO for ₱' . number_format($total_cost, 2) . ' placed with supplier.',
-                        'info',
-                        'info'
+                        'info', 'info'
                     );
                 }
 
@@ -317,7 +528,7 @@ try {
 
 
         // ============================================================
-        // PUT — update
+        // PUT
         // ============================================================
         case 'PUT':
             $id = isset($_GET['id']) ? (int)$_GET['id'] : null;
@@ -326,7 +537,7 @@ try {
             $allowed = [
                 'status','lifecycle_status','received_date','expected_delivery',
                 'notes','payment_terms','payment_status','amount_paid',
-                'closed_at','closed_by'
+                'payment_method','payment_reference','closed_at','closed_by'
             ];
             $fields = [];
             $params = [];
@@ -338,7 +549,6 @@ try {
                 }
             }
 
-            // Auto-set received_date when moving to received
             if (($input['status'] ?? null) === 'received' && empty($input['received_date'])) {
                 $fields[] = 'received_date = NOW()';
             }
@@ -360,7 +570,6 @@ try {
             $id = isset($_GET['id']) ? (int)$_GET['id'] : null;
             if (!$id) throw new InvalidArgumentException('ID required');
 
-            // Guard: don't allow deleting paid POs
             $chk = $conn->prepare("SELECT payment_status, amount_paid FROM purchase_orders WHERE id = ?");
             $chk->execute([$id]);
             $row = $chk->fetch(PDO::FETCH_ASSOC);
@@ -387,7 +596,7 @@ try {
 
 
 // ============================================================
-// Helpers
+// Global helpers
 // ============================================================
 function respond_json(array $payload, int $code = 200): void {
     http_response_code($code);
@@ -395,9 +604,6 @@ function respond_json(array $payload, int $code = 200): void {
     exit();
 }
 
-/**
- * Enrich a PO row with computed payment fields.
- */
 function po_enrich(array $po): array {
     $total  = (float)($po['total_cost']   ?? 0);
     $paid   = (float)($po['amount_paid']  ?? 0);
@@ -407,7 +613,6 @@ function po_enrich(array $po): array {
     $status        = (string)($po['status']           ?? '');
     $paymentStatus = (string)($po['payment_status']   ?? 'unpaid');
 
-    // Recompute payment_status if inconsistent
     if ($paid <= 0)               $paymentStatus = 'unpaid';
     elseif ($paid >= $total)      $paymentStatus = 'paid';
     else                          $paymentStatus = 'partial';
@@ -424,13 +629,12 @@ function po_enrich(array $po): array {
         $blocker = 'Already fully paid';
     }
 
-    $po['balance_due']       = number_format($due, 2, '.', '');
-    $po['payment_status']    = $paymentStatus;
-    $po['can_pay']           = $payable;
-    $po['payment_blocker']   = $blocker;
-    $po['days_overdue']      = po_days_overdue($po['expected_delivery'] ?? null, $paymentStatus);
+    $po['balance_due']     = number_format($due, 2, '.', '');
+    $po['payment_status']  = $paymentStatus;
+    $po['can_pay']         = $payable;
+    $po['payment_blocker'] = $blocker;
+    $po['days_overdue']    = po_days_overdue($po['expected_delivery'] ?? null, $paymentStatus);
 
-    // Pre-fill payment metadata the frontend will pass to PayMongoCheckout.vue
     $po['payment_meta'] = [
         'po_id'       => (int)$po['id'],
         'supplier_id' => (int)$po['supplier_id'],
