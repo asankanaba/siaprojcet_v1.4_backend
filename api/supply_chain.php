@@ -1,15 +1,15 @@
 <?php
 // ============================================
 // 📁 File: api/supply_chain.php
-// 🔧 Supply Chain Requests Flow (7 statuses)
+// 🔧 Supply Chain Requests Flow with PO + GRN bridging
 //
 // FLOW:
 //   pending     → Staff creates request
 //   approved    → Finance approves budget (or auto-approved from product request)
 //   rejected    → Finance denies budget
-//   ordered     → Supply Chain placed order with supplier (supplier_id set here)
+//   ordered     → Supply Chain placed order (creates purchase_orders row)
 //   unavailable → Supplier has no stock
-//   received    → Goods arrived, stock++ (via po_deliveries OR direct)
+//   received    → Goods arrived, stock++, GRN created
 //   paid        → Finance paid supplier via PayMongo
 // ============================================
 
@@ -28,6 +28,49 @@ require_once __DIR__ . '/../config/database.php';
 
 $method = $_SERVER['REQUEST_METHOD'];
 $input  = json_decode(file_get_contents('php://input'), true) ?: [];
+
+// ============================================
+// Helper: generate unique PO number
+// ============================================
+function generate_po_number($conn) {
+    $prefix = 'PO-' . date('Ymd') . '-';
+    // Find highest existing PO number for today
+    $stmt = $conn->prepare("
+        SELECT po_number FROM purchase_orders
+        WHERE po_number LIKE :prefix
+        ORDER BY po_number DESC LIMIT 1
+    ");
+    $stmt->execute([':prefix' => $prefix . '%']);
+    $last = $stmt->fetchColumn();
+
+    if ($last) {
+        $seq = (int)substr($last, -4) + 1;
+    } else {
+        $seq = 1001;
+    }
+    return $prefix . str_pad($seq, 4, '0', STR_PAD_LEFT);
+}
+
+// ============================================
+// Helper: generate unique GRN number
+// ============================================
+function generate_grn_number($conn) {
+    $prefix = 'GRN-' . date('Ymd') . '-';
+    $stmt = $conn->prepare("
+        SELECT grn_number FROM po_deliveries
+        WHERE grn_number LIKE :prefix
+        ORDER BY grn_number DESC LIMIT 1
+    ");
+    $stmt->execute([':prefix' => $prefix . '%']);
+    $last = $stmt->fetchColumn();
+
+    if ($last) {
+        $seq = (int)substr($last, -4) + 1;
+    } else {
+        $seq = 1001;
+    }
+    return $prefix . str_pad($seq, 4, '0', STR_PAD_LEFT);
+}
 
 try {
     $db   = new Database();
@@ -81,20 +124,24 @@ try {
             exit();
         }
 
-        // Single request
+        // Single request — includes linked PO info
         if (isset($_GET['id'])) {
             $stmt = $conn->prepare("
                 SELECT r.*,
                        p.name AS product_name, p.stock AS product_stock,
                        s.name AS supplier_name, s.stock_available AS supplier_stock,
                        u.full_name AS requester_name,
-                       a.full_name AS approver_name
+                       a.full_name AS approver_name,
+                       po.id AS po_id, po.po_number, po.lifecycle_status AS po_lifecycle
                 FROM supply_chain_requests r
                 LEFT JOIN products  p ON r.product_id   = p.id
                 LEFT JOIN suppliers s ON r.supplier_id  = s.id
                 LEFT JOIN users     u ON r.requested_by = u.id
                 LEFT JOIN users     a ON r.approved_by  = a.id
+                LEFT JOIN purchase_orders po ON po.requisition_id = r.id
                 WHERE r.id = ?
+                ORDER BY po.id DESC
+                LIMIT 1
             ");
             $stmt->execute([(int)$_GET['id']]);
             $row = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -107,18 +154,21 @@ try {
             exit();
         }
 
-        // List all requests
+        // List all requests — includes linked PO info
         $stmt = $conn->prepare("
             SELECT r.*,
                    p.name AS product_name,
                    s.name AS supplier_name,
                    u.full_name AS requester_name,
-                   a.full_name AS approver_name
+                   a.full_name AS approver_name,
+                   po.id AS po_id, po.po_number, po.lifecycle_status AS po_lifecycle,
+                   po.payment_status
             FROM supply_chain_requests r
             LEFT JOIN products  p ON r.product_id   = p.id
             LEFT JOIN suppliers s ON r.supplier_id  = s.id
             LEFT JOIN users     u ON r.requested_by = u.id
             LEFT JOIN users     a ON r.approved_by  = a.id
+            LEFT JOIN purchase_orders po ON po.requisition_id = r.id
             ORDER BY r.created_at DESC
         ");
         $stmt->execute();
@@ -162,7 +212,7 @@ try {
                 exit();
             }
 
-            // Find supplier for this product (auto-pick cheapest by default — Supply Chain can override later)
+            // Find supplier for this product (auto-pick cheapest)
             $stmt = $conn->prepare("
                 SELECT id, name, stock_available, price_per_unit, lead_time_days
                 FROM suppliers
@@ -219,7 +269,8 @@ try {
 
     // ============================================
     // PUT — Update status
-    // Accepts supplier_id when status = 'ordered'
+    // On 'ordered'  → create purchase_orders row
+    // On 'received' → create po_deliveries GRN + stock++
     // ============================================
     if ($method === 'PUT') {
         $id     = (int)($_GET['id'] ?? ($input['id'] ?? 0));
@@ -265,12 +316,10 @@ try {
             $newSupplier  = isset($input['supplier_id']) ? (int)$input['supplier_id'] : null;
             $newQuantity  = isset($input['quantity'])    ? (int)$input['quantity']    : null;
 
-            // If ordering → supplier_id is required
             if ($status === 'ordered' && !$newSupplier && !$req['supplier_id']) {
                 throw new Exception('Please select a supplier before ordering.');
             }
 
-            // Build dynamic update
             $fields = [
                 'status = :status',
                 'approved_by = COALESCE(:approved_by, approved_by)',
@@ -313,19 +362,168 @@ try {
             foreach ($params as $k => $v) $stmt->bindValue($k, $v);
             $stmt->execute();
 
-            // STATUS-SPECIFIC LOGIC
+            // ============================================
+            // 🚚 ORDERED → CREATE PURCHASE ORDER
+            // ============================================
+            if ($status === 'ordered') {
+                $sid = $newSupplier ?: $req['supplier_id'];
+                $qty = $newQuantity ?: (int)$req['quantity'];
 
-            // 🔥 RECEIVED → increase product stock (ONCE)
+                // Get supplier pricing + lead time
+                $sStmt = $conn->prepare("
+                    SELECT id, name, price_per_unit, lead_time_days, payment_terms
+                    FROM suppliers WHERE id = ?
+                ");
+                $sStmt->execute([$sid]);
+                $sup = $sStmt->fetch(PDO::FETCH_ASSOC);
+
+                if (!$sup) throw new Exception('Supplier not found');
+
+                $unitPrice  = (float)($sup['price_per_unit'] ?? 0);
+                $totalCost  = $unitPrice * $qty;
+                $leadDays   = (int)($sup['lead_time_days'] ?? 3);
+                $poNumber   = generate_po_number($conn);
+                $expected   = date('Y-m-d', strtotime("+{$leadDays} days"));
+                $orderedBy  = $approvedBy ?: 1;
+
+                // Check if a PO already exists for this requisition (idempotency)
+                $existing = $conn->prepare("SELECT id, po_number FROM purchase_orders WHERE requisition_id = ?");
+                $existing->execute([$id]);
+                $existingPo = $existing->fetch(PDO::FETCH_ASSOC);
+
+                if ($existingPo) {
+                    // Update the existing PO
+                    $upd = $conn->prepare("
+                        UPDATE purchase_orders
+                        SET supplier_id = ?, quantity = ?, unit_price = ?, total_cost = ?,
+                            status = 'ordered', lifecycle_status = 'ordered',
+                            expected_delivery = ?, updated_at = NOW()
+                        WHERE id = ?
+                    ");
+                    $upd->execute([$sid, $qty, $unitPrice, $totalCost, $expected, $existingPo['id']]);
+                    $poId     = (int)$existingPo['id'];
+                    $poNumber = $existingPo['po_number'];
+                } else {
+                    // Create new PO
+                    $ins = $conn->prepare("
+                        INSERT INTO purchase_orders
+                            (po_number, requisition_id, product_id, supplier_id,
+                             quantity, unit_price, total_cost, ordered_by,
+                             ordered_date, expected_delivery, status,
+                             lifecycle_status, payment_terms, payment_status,
+                             amount_paid, notes)
+                        VALUES
+                            (:po_number, :req_id, :pid, :sid,
+                             :qty, :unit_price, :total_cost, :ordered_by,
+                             NOW(), :expected, 'ordered',
+                             'ordered', :terms, 'unpaid',
+                             0, :notes)
+                    ");
+                    $ins->execute([
+                        ':po_number'   => $poNumber,
+                        ':req_id'      => $id,
+                        ':pid'         => (int)$req['product_id'],
+                        ':sid'         => $sid,
+                        ':qty'         => $qty,
+                        ':unit_price'  => $unitPrice,
+                        ':total_cost'  => $totalCost,
+                        ':ordered_by'  => $orderedBy,
+                        ':expected'    => $expected,
+                        ':terms'       => $sup['payment_terms'] ?? 'Net 30',
+                        ':notes'       => "Auto-created from supply chain request #{$id}",
+                    ]);
+                    $poId = (int)$conn->lastInsertId();
+                }
+
+                if (function_exists('notifyRole')) {
+                    notifyRole(
+                        $conn,
+                        ['finance', 'super_admin', 'admin'],
+                        '🚚 Purchase Order Created',
+                        "PO {$poNumber} — {$req['product_name']} × {$qty} from {$sup['name']} (₱" . number_format($totalCost, 2) . ")",
+                        'info',
+                        'info'
+                    );
+                }
+            }
+
+            // ============================================
+            // 📦 RECEIVED → CREATE GRN + stock++
+            // ============================================
             if ($status === 'received' && $req['status'] !== 'received') {
+                // Find the linked PO
+                $poStmt = $conn->prepare("
+                    SELECT id, po_number, quantity FROM purchase_orders
+                    WHERE requisition_id = ? ORDER BY id DESC LIMIT 1
+                ");
+                $poStmt->execute([$id]);
+                $po = $poStmt->fetch(PDO::FETCH_ASSOC);
+
+                $qty       = (int)$req['quantity'];
+                $receivedBy = $approvedBy ?: 1;
+
+                if ($po) {
+                    // Create GRN in po_deliveries
+                    $grnNumber = generate_grn_number($conn);
+                    $grnStmt = $conn->prepare("
+                        INSERT INTO po_deliveries
+                            (po_id, grn_number, received_by, qty_ordered,
+                             qty_received, qty_rejected, condition_notes, status)
+                        VALUES (?, ?, ?, ?, ?, 0, ?, 'complete')
+                    ");
+                    $grnStmt->execute([
+                        $po['id'],
+                        $grnNumber,
+                        $receivedBy,
+                        (int)$po['quantity'],
+                        $qty,
+                        "Auto-generated from supply chain request #{$id}",
+                    ]);
+                    $grnId = (int)$conn->lastInsertId();
+
+                    // Update PO lifecycle
+                    $upd = $conn->prepare("
+                        UPDATE purchase_orders
+                        SET lifecycle_status = 'grn_posted',
+                            status = 'received',
+                            received_date = NOW(),
+                            updated_at = NOW()
+                        WHERE id = ?
+                    ");
+                    $upd->execute([$po['id']]);
+                } else {
+                    // No PO found — still create GRN? Just bump stock.
+                    $grnNumber = null;
+                    $grnId = null;
+                }
+
+                // Increase product stock
                 $stmt = $conn->prepare("UPDATE products SET stock = stock + ? WHERE id = ?");
-                $stmt->execute([(int)$req['quantity'], (int)$req['product_id']]);
+                $stmt->execute([$qty, (int)$req['product_id']]);
+
+                // Log in inventory
+                try {
+                    $logStmt = $conn->prepare("
+                        INSERT INTO inventory_logs (product_id, quantity_change, type, note, user_id)
+                        VALUES (?, ?, 'restock', ?, ?)
+                    ");
+                    $logStmt->execute([
+                        (int)$req['product_id'],
+                        $qty,
+                        $grnNumber
+                            ? "Goods received — GRN {$grnNumber} (PO {$po['po_number']})"
+                            : "Goods received via supply chain request #{$id}",
+                        $receivedBy,
+                    ]);
+                } catch (Throwable $ignored) { /* inventory_logs may not exist; safe to skip */ }
 
                 if (function_exists('notifyRole')) {
                     notifyRole(
                         $conn,
                         ['finance', 'supply_chain', 'super_admin', 'admin'],
                         '✅ Stock Received',
-                        "{$req['product_name']} × {$req['quantity']} added to inventory.",
+                        "{$req['product_name']} × {$qty} added to inventory" .
+                        ($grnNumber ? " (GRN {$grnNumber})" : '') . '.',
                         'success',
                         'success'
                     );
@@ -344,7 +542,7 @@ try {
                 );
             }
 
-            // ❌ REJECTED → notify requester
+            // ❌ REJECTED
             if ($status === 'rejected' && function_exists('createNotification')) {
                 createNotification(
                     $conn,
@@ -357,25 +555,7 @@ try {
                 );
             }
 
-            // 🚚 ORDERED → notify Finance
-            if ($status === 'ordered' && function_exists('notifyRole')) {
-                $supplierName = $req['supplier_name'] ?? 'selected supplier';
-                if ($newSupplier) {
-                    $sStmt = $conn->prepare("SELECT name FROM suppliers WHERE id = ?");
-                    $sStmt->execute([$newSupplier]);
-                    $supplierName = $sStmt->fetchColumn() ?: $supplierName;
-                }
-                notifyRole(
-                    $conn,
-                    ['finance', 'super_admin', 'admin'],
-                    '🚚 Purchase Order Placed',
-                    "{$req['product_name']} × {$req['quantity']} ordered from {$supplierName}.",
-                    'info',
-                    'info'
-                );
-            }
-
-            // ⚠️ UNAVAILABLE → notify requester
+            // ⚠️ UNAVAILABLE
             if ($status === 'unavailable' && function_exists('createNotification')) {
                 createNotification(
                     $conn,
@@ -400,10 +580,19 @@ try {
             }
 
             $conn->commit();
-            echo json_encode([
+
+            $response = [
                 'success' => true,
                 'message' => "Request status updated to '{$status}'",
-            ]);
+            ];
+            if ($status === 'ordered' && isset($poNumber)) {
+                $response['po_number'] = $poNumber;
+                $response['po_id']     = $poId;
+            }
+            if ($status === 'received' && isset($grnNumber)) {
+                $response['grn_number'] = $grnNumber;
+            }
+            echo json_encode($response);
             exit();
 
         } catch (Throwable $e) {
