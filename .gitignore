@@ -13,7 +13,7 @@
 .env.local
 
 # 🔐 Cloudinary credentials (never commit)
-config/cloudinary.php
+
 
 # IDE
 .vscode/
