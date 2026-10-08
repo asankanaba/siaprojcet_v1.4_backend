@@ -13,10 +13,10 @@
 //      - refund.updated
 //      - refund.succeeded
 //      - link.payment.paid
+//    ✅ Updates linked supply_chain_requests when payment succeeds
 // ============================================================
 declare(strict_types=1);
 
-// Don't let PHP leak anything to the response
 ini_set('display_errors', '0');
 error_reporting(E_ALL);
 
@@ -26,9 +26,6 @@ require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../config/paymongo.php';
 require_once __DIR__ . '/_paymongo_client.php';
 
-// ------------------------------------------------------------
-// Read raw body FIRST (before any parsing)
-// ------------------------------------------------------------
 $rawBody = file_get_contents('php://input');
 
 if ($rawBody === false || $rawBody === '') {
@@ -46,9 +43,6 @@ if (!is_array($payload) || empty($payload['data'])) {
     exit();
 }
 
-// ------------------------------------------------------------
-// Signature verification
-// ------------------------------------------------------------
 $signatureHeader = $_SERVER['HTTP_PAYMONGO_SIGNATURE'] ?? '';
 $sigOk = verify_paymongo_signature($rawBody, $signatureHeader);
 
@@ -57,7 +51,6 @@ if (!$sigOk && PAYMONGO_WEBHOOK_SECRET !== '') {
         'header' => $signatureHeader,
         'len'    => strlen($rawBody),
     ]);
-    // Log to DB for audit
     try {
         $db = new Database();
         $c = $db->getConnection();
@@ -79,19 +72,14 @@ if (!$sigOk && PAYMONGO_WEBHOOK_SECRET !== '') {
     exit();
 }
 
-// ------------------------------------------------------------
-// Extract event
-// ------------------------------------------------------------
 $data       = $payload['data'];
 $eventId    = $data['id'] ?? null;
 $eventType  = $data['attributes']['type']       ?? 'unknown';
 $livemode   = (bool)($data['attributes']['livemode'] ?? false);
-$eventData  = $data['attributes']['data']       ?? [];      // the resource itself
+$eventData  = $data['attributes']['data']       ?? [];
 $resourceId = $eventData['id']                  ?? null;
 
-// Dedup event_id
 if (!$eventId) {
-    // Some events have no id; fall back to a hash
     $eventId = 'evt-' . substr(hash('sha256', $rawBody), 0, 24);
 }
 
@@ -101,9 +89,6 @@ paymongo_log('info', "Webhook received: {$eventType}", [
     'livemode' => $livemode,
 ]);
 
-// ------------------------------------------------------------
-// Process
-// ------------------------------------------------------------
 $db   = new Database();
 $conn = $db->getConnection();
 
@@ -114,8 +99,7 @@ if (!$conn) {
     exit();
 }
 
-// Insert event row first — UNIQUE on event_id gives us dedup for free
-$inserted = false;
+$eventRowId = 0;
 try {
     $stmt = $conn->prepare("
         INSERT INTO paymongo_webhook_events
@@ -129,10 +113,8 @@ try {
         $resourceId,
         substr($rawBody, 0, 65000),
     ]);
-    $inserted = true;
     $eventRowId = (int) $conn->lastInsertId();
 } catch (PDOException $e) {
-    // Duplicate event_id → already processed, ack and exit
     if (strpos($e->getMessage(), 'Duplicate') !== false) {
         paymongo_log('warning', "Webhook: duplicate event {$eventId} — ignoring");
         echo json_encode(['ok' => true, 'duplicate' => true]);
@@ -144,14 +126,10 @@ try {
     exit();
 }
 
-// ------------------------------------------------------------
-// Route event
-// ------------------------------------------------------------
 $result = ['handled' => false, 'message' => null, 'payment_id' => null];
 
 try {
     switch ($eventType) {
-
         case 'payment.paid':
         case 'checkout_session.payment.paid':
         case 'link.payment.paid':
@@ -184,9 +162,6 @@ try {
     ]);
 }
 
-// ------------------------------------------------------------
-// Mark event processed
-// ------------------------------------------------------------
 try {
     $conn->prepare("
         UPDATE paymongo_webhook_events
@@ -215,25 +190,19 @@ exit();
 // HANDLERS
 // ============================================================
 
-/**
- * payment.paid / checkout_session.payment.paid / link.payment.paid
- */
 function handle_payment_paid(PDO $conn, string $eventType, array $eventData): array
 {
     $resourceId = $eventData['id'] ?? null;
     $attrs      = $eventData['attributes'] ?? [];
 
-    // Try multiple ways to find our payment row
     $pay = null;
 
-    // 1) by checkout_session id
     if (!$pay && $resourceId && strpos($resourceId, 'cs_') === 0) {
         $stmt = $conn->prepare("SELECT * FROM payments WHERE paymongo_checkout_id = ? LIMIT 1");
         $stmt->execute([$resourceId]);
         $pay = $stmt->fetch(PDO::FETCH_ASSOC);
     }
 
-    // 2) by payment_intent id
     if (!$pay) {
         $intentId = $attrs['payment_intent_id'] ?? null;
         if ($intentId) {
@@ -243,14 +212,12 @@ function handle_payment_paid(PDO $conn, string $eventType, array $eventData): ar
         }
     }
 
-    // 3) by link id
     if (!$pay && $resourceId && strpos($resourceId, 'link_') === 0) {
         $stmt = $conn->prepare("SELECT * FROM payments WHERE paymongo_link_id = ? LIMIT 1");
         $stmt->execute([$resourceId]);
         $pay = $stmt->fetch(PDO::FETCH_ASSOC);
     }
 
-    // 4) by reference_number (our payment_ref)
     if (!$pay) {
         $ref = $attrs['reference_number'] ?? null;
         if ($ref) {
@@ -268,7 +235,6 @@ function handle_payment_paid(PDO $conn, string $eventType, array $eventData): ar
         return ['handled' => true, 'message' => 'Already succeeded (idempotent skip)', 'payment_id' => (int)$pay['id']];
     }
 
-    // Extract payment_id from nested payments array if present
     $paymongoPaymentId = null;
     if (!empty($attrs['payments'][0]['id'])) {
         $paymongoPaymentId = $attrs['payments'][0]['id'];
@@ -297,13 +263,14 @@ function handle_payment_paid(PDO $conn, string $eventType, array $eventData): ar
             $pay['id'],
         ]);
 
-        // Update PO
+        // ✅ Update PO
         if (!empty($pay['po_id'])) {
             $conn->prepare("
                 UPDATE purchase_orders
                 SET amount_paid = amount_paid + ?,
                     payment_status = IF(amount_paid + ? >= total_cost, 'paid', 'partial'),
-                    lifecycle_status = IF(amount_paid + ? >= total_cost, 'paid', lifecycle_status)
+                    lifecycle_status = IF(amount_paid + ? >= total_cost, 'paid', lifecycle_status),
+                    updated_at = NOW()
                 WHERE id = ?
             ")->execute([
                 (float)$pay['amount'],
@@ -311,15 +278,27 @@ function handle_payment_paid(PDO $conn, string $eventType, array $eventData): ar
                 (float)$pay['amount'],
                 (int)$pay['po_id'],
             ]);
+
+            // ✅ NEW: Update the linked supply_chain_requests row
+            $conn->prepare("
+                UPDATE supply_chain_requests r
+                JOIN purchase_orders po ON po.requisition_id = r.id
+                SET r.status     = 'paid',
+                    r.paid_by    = po.ordered_by,
+                    r.paid_at    = COALESCE(r.paid_at, NOW()),
+                    r.updated_at = NOW()
+                WHERE po.id = ?
+                  AND r.status IN ('received', 'ordered')
+            ")->execute([(int)$pay['po_id']]);
         }
 
-        // Update supplier invoice
+        // ✅ Update supplier invoice
         if (!empty($pay['invoice_id'])) {
             $conn->prepare("UPDATE supplier_invoices SET status = 'paid' WHERE id = ?")
                  ->execute([(int)$pay['invoice_id']]);
         }
 
-        // Expense transaction (once)
+        // Expense transaction
         $conn->prepare("
             INSERT INTO transactions
                 (description, amount, type, category, date, status, reference)
@@ -348,9 +327,6 @@ function handle_payment_paid(PDO $conn, string $eventType, array $eventData): ar
     return ['handled' => true, 'message' => 'Payment marked succeeded', 'payment_id' => (int)$pay['id']];
 }
 
-/**
- * payment.failed
- */
 function handle_payment_failed(PDO $conn, array $eventData): array
 {
     $resourceId = $eventData['id']     ?? null;
@@ -391,10 +367,6 @@ function handle_payment_failed(PDO $conn, array $eventData): array
     return ['handled' => true, 'message' => 'Marked failed', 'payment_id' => (int)$pay['id']];
 }
 
-/**
- * source.chargeable — GCash/Maya/GrabPay finished authorizing. We must
- * now create a Payment Intent and attach the source to actually capture.
- */
 function handle_source_chargeable(PDO $conn, array $eventData): array
 {
     $sourceId = $eventData['id'] ?? null;
@@ -411,12 +383,9 @@ function handle_source_chargeable(PDO $conn, array $eventData): array
         return ['handled' => true, 'message' => 'Already processing/succeeded', 'payment_id' => (int)$pay['id']];
     }
 
-    // Mark processing
     $conn->prepare("UPDATE payments SET status = 'processing', paymongo_status = 'source_chargeable' WHERE id = ?")
          ->execute([$pay['id']]);
 
-    // Fire a background request to our own capture endpoint
-    // Simpler approach: do it inline (fast enough — <2s)
     try {
         $pm = new PayMongoClient();
         $intentRes = $pm->createPaymentIntent([
@@ -463,9 +432,6 @@ function handle_source_chargeable(PDO $conn, array $eventData): array
     }
 }
 
-/**
- * refund.updated / refund.succeeded / refund.failed
- */
 function handle_refund_event(PDO $conn, string $eventType, array $eventData): array
 {
     $refundId = $eventData['id'] ?? null;
@@ -474,7 +440,6 @@ function handle_refund_event(PDO $conn, string $eventType, array $eventData): ar
     $pmtId    = $attrs['payment_id'] ?? null;
     $amount   = isset($attrs['amount']) ? ((int)$attrs['amount']) / 100 : null;
 
-    // Find payment by refund_ref or payment_id
     $stmt = $conn->prepare("
         SELECT * FROM payments
         WHERE refund_ref = ?
@@ -487,7 +452,6 @@ function handle_refund_event(PDO $conn, string $eventType, array $eventData): ar
 
     $newRefunded = (float)$pay['refunded_amount'];
     if ($status === 'succeeded' && $amount !== null) {
-        // Ensure we don't double count on repeated events
         if ($newRefunded < $amount) {
             $newRefunded = (float)$amount;
         }
@@ -512,9 +476,6 @@ function handle_refund_event(PDO $conn, string $eventType, array $eventData): ar
     return ['handled' => true, 'message' => "Refund {$status}", 'payment_id' => (int)$pay['id']];
 }
 
-// ============================================================
-// Signature verification
-// ============================================================
 function verify_paymongo_signature(string $rawBody, string $header): bool
 {
     if ($header === '') return false;
@@ -529,7 +490,6 @@ function verify_paymongo_signature(string $rawBody, string $header): bool
     $timestamp = $parts['t'];
     $signedPayload = $timestamp . '.' . $rawBody;
 
-    // Reject very old timestamps (5 min) to prevent replay
     if (abs(time() - (int)$timestamp) > 300) {
         paymongo_log('warning', 'Webhook: timestamp too old', ['t' => $timestamp]);
         return false;
@@ -540,8 +500,8 @@ function verify_paymongo_signature(string $rawBody, string $header): bool
 
     $expected = hash_hmac('sha256', $signedPayload, $secret);
     $candidates = array_filter([
-        $parts['te'] ?? null,   // test mode
-        $parts['li'] ?? null,   // live mode
+        $parts['te'] ?? null,
+        $parts['li'] ?? null,
     ]);
 
     foreach ($candidates as $sig) {
