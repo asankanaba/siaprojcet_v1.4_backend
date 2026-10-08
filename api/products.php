@@ -4,6 +4,7 @@
 // ✅ Portable paths (__DIR__)
 // ✅ POST with ?id= updates (prevents duplicate on edit)
 // ✅ Soft-delete when FK references exist
+// ✅ Cloudinary image uploads + URL fallback
 header("Access-Control-Allow-Origin: *");
 header("Content-Type: application/json; charset=UTF-8");
 header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
@@ -16,6 +17,7 @@ if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
 }
 
 require_once __DIR__ . '/../config/database.php';
+require_once __DIR__ . '/_cloudinary_client.php';
 
 $method = $_SERVER['REQUEST_METHOD'];
 
@@ -57,27 +59,37 @@ function find_product_reference($conn, $productId) {
 }
 
 // ============================================
-// HELPER — save uploaded image
+// HELPER — resolve image URL from either a
+// pasted URL (secondary) or an uploaded file (primary)
 // ============================================
-function save_product_image() {
-    if (!isset($_FILES['image']) || $_FILES['image']['error'] !== UPLOAD_ERR_OK) {
-        return null;
+function resolve_product_image($data) {
+    // 1. Pasted URL (only if no file uploaded — file takes priority)
+    $pasted = trim((string)($data['image_url'] ?? ''));
+    $hasFile = isset($_FILES['image']) && $_FILES['image']['error'] === UPLOAD_ERR_OK;
+
+    if (!$hasFile && $pasted !== '' && preg_match('#^https?://#i', $pasted)) {
+        return $pasted;
     }
-    $isVercel = getenv('VERCEL') === '1';
-    $uploadDir = $isVercel
-        ? sys_get_temp_dir() . '/uploads/products/'
-        : __DIR__ . '/../uploads/products/';
 
-    if (!is_dir($uploadDir)) mkdir($uploadDir, 0777, true);
-
-    $ext = pathinfo($_FILES['image']['name'], PATHINFO_EXTENSION);
-    $newName = uniqid('product_') . '.' . $ext;
-    $target = $uploadDir . $newName;
-
-    if (move_uploaded_file($_FILES['image']['tmp_name'], $target)) {
-        return '/uploads/products/' . $newName;
+    // 2. File upload → Cloudinary
+    if ($hasFile) {
+        try {
+            $client = new CloudinaryClient();
+            $res = $client->uploadFile($_FILES['image']['tmp_name'], $_FILES['image']['name']);
+            if ($res['ok'] && !empty($res['url'])) {
+                return $res['url'];
+            }
+            cloudinary_log('error', 'products.php upload failed', [
+                'error' => $res['error'] ?? 'unknown',
+            ]);
+        } catch (Throwable $e) {
+            cloudinary_log('error', 'products.php upload exception', [
+                'error' => $e->getMessage(),
+            ]);
+        }
     }
-    return null;
+
+    return null; // no image provided
 }
 
 // ============================================
@@ -130,8 +142,8 @@ if ($method === 'POST') {
             $data = json_decode(file_get_contents("php://input"), true) ?: [];
         }
 
-        // Shared image upload
-        $image_url = save_product_image();
+        // ✅ Resolve image (Cloudinary upload OR pasted URL)
+        $image_url = resolve_product_image($data);
 
         // ============================================
         // UPDATE PATH (POST with ?id=N)
@@ -162,7 +174,7 @@ if ($method === 'POST') {
                 $params[':category_id'] = normalize_category_id($conn, $data['category_id']);
             }
 
-            // Image update
+            // Image update — only if a new image was provided
             if ($image_url !== null) {
                 $updates[] = "image_url = :image_url";
                 $params[':image_url'] = $image_url;
@@ -266,7 +278,8 @@ if ($method === 'PUT') {
             $params[':category_id'] = normalize_category_id($conn, $data['category_id']);
         }
 
-        $image_url = save_product_image();
+        // ✅ Resolve image (Cloudinary upload OR pasted URL)
+        $image_url = resolve_product_image($data);
         if ($image_url !== null) {
             $updates[] = "image_url = :image_url";
             $params[':image_url'] = $image_url;

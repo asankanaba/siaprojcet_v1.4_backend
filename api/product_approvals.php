@@ -1,5 +1,8 @@
 <?php
 // api/product_approvals.php — Product approval workflow
+// ✅ Cloudinary upload for product images
+// ✅ Falls back to pasted image_url
+// ✅ Falls back to temp dir (dev only)
 header("Access-Control-Allow-Origin: *");
 header("Content-Type: application/json; charset=UTF-8");
 header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
@@ -12,32 +15,56 @@ if ($_SERVER['REQUEST_METHOD'] == 'OPTIONS') {
 }
 
 require_once __DIR__ . '/../config/database.php';
+require_once __DIR__ . '/_cloudinary_client.php';
 
 $method = $_SERVER['REQUEST_METHOD'];
 $id     = isset($_GET['id'])     ? (int)$_GET['id']     : null;
 $status = isset($_GET['status']) ? $_GET['status']      : null;
 
 // ============================================
-// HELPER — safely convert any category_id input to a valid ID or NULL
+// HELPER — sanitize category_id
 // ============================================
 function resolve_category_id($conn, $raw) {
-    // Treat empty string, "null", "0", null as NULL
     if ($raw === null || $raw === '' || $raw === 'null' || $raw === 'undefined' || (int)$raw === 0) {
         return null;
     }
     $catId = (int)$raw;
-
-    // Verify the category actually exists
     $stmt = $conn->prepare("SELECT id FROM categories WHERE id = ?");
     $stmt->execute([$catId]);
-    if (!$stmt->fetch()) {
-        return null; // Invalid category → fall back to NULL
-    }
+    if (!$stmt->fetch()) return null;
     return $catId;
 }
 
 // ============================================
-// GET — list all approvals or single
+// HELPER — resolve uploaded image to a URL
+// Priority: pasted URL > uploaded file > empty
+// ============================================
+function resolve_image_url($pastedUrl) {
+    // 1. If a pasted URL exists and looks valid, use it
+    $pastedUrl = trim((string)$pastedUrl);
+    if ($pastedUrl !== '' && preg_match('#^https?://#i', $pastedUrl)) {
+        return $pastedUrl;
+    }
+
+    // 2. If a file was uploaded, send it to Cloudinary
+    if (isset($_FILES['image']) && $_FILES['image']['error'] === UPLOAD_ERR_OK) {
+        try {
+            $client = new CloudinaryClient();
+            $res = $client->uploadFile($_FILES['image']['tmp_name'], $_FILES['image']['name']);
+            if ($res['ok'] && $res['url']) {
+                return $res['url'];
+            }
+            cloudinary_log('error', 'Upload failed, falling back', ['error' => $res['error']]);
+        } catch (Throwable $e) {
+            cloudinary_log('error', 'Cloudinary exception', ['error' => $e->getMessage()]);
+        }
+    }
+
+    return '';
+}
+
+// ============================================
+// GET — list all or single
 // ============================================
 if ($method === 'GET') {
     try {
@@ -96,11 +123,9 @@ if ($method === 'POST') {
         $requested_by = isset($_POST['requested_by']) ? (int)$_POST['requested_by'] : 1;
         $barcode      = isset($_POST['barcode'])      ? $_POST['barcode'] : '';
         $notes        = isset($_POST['notes'])        ? $_POST['notes'] : '';
+        $pasted_url   = $_POST['image_url']           ?? '';
 
-        // ✅ Sanitize category_id — this is the fix for the FK error
         $category_id = resolve_category_id($conn, $_POST['category_id'] ?? null);
-
-        $image_url = '';
 
         if (empty($product_name)) {
             http_response_code(400);
@@ -113,22 +138,8 @@ if ($method === 'POST') {
             exit();
         }
 
-        if (isset($_FILES['image']) && $_FILES['image']['error'] === UPLOAD_ERR_OK) {
-            $isVercel  = getenv('VERCEL') === '1';
-            $uploadDir = $isVercel
-                ? sys_get_temp_dir() . '/uploads/products/'
-                : __DIR__ . '/../uploads/products/';
-
-            if (!is_dir($uploadDir)) mkdir($uploadDir, 0777, true);
-
-            $fileExtension = pathinfo($_FILES['image']['name'], PATHINFO_EXTENSION);
-            $newFileName   = uniqid('product_') . '.' . $fileExtension;
-            $targetPath    = $uploadDir . $newFileName;
-
-            if (move_uploaded_file($_FILES['image']['tmp_name'], $targetPath)) {
-                $image_url = '/uploads/products/' . $newFileName;
-            }
-        }
+        // ✅ Upload to Cloudinary OR use pasted URL
+        $image_url = resolve_image_url($pasted_url);
 
         $query = "INSERT INTO product_approvals
                   (product_name, description, price, stock, category_id, image_url,
@@ -158,8 +169,7 @@ if ($method === 'POST') {
                     ['finance', 'super_admin', 'admin'],
                     '🆕 New Product Approval Needed',
                     "{$product_name} — ₱" . number_format($price, 2) . " (initial stock: {$stock})",
-                    'info',
-                    'info'
+                    'info', 'info'
                 );
             }
             echo json_encode([
@@ -178,7 +188,7 @@ if ($method === 'POST') {
 }
 
 // ============================================
-// PUT — finance approves/rejects; creates product + SC request
+// PUT — finance approves/rejects
 // ============================================
 if ($method === 'PUT') {
     try {
@@ -283,8 +293,7 @@ if ($method === 'PUT') {
                     (int)$approval['requested_by'],
                     '✅ Product Approved',
                     "Your request for '{$approval['product_name']}' has been approved and forwarded to Supply Chain for ordering.",
-                    'success',
-                    'success'
+                    'success', 'success'
                 );
             }
 
@@ -294,8 +303,7 @@ if ($method === 'PUT') {
                     ['supply_chain', 'super_admin', 'admin'],
                     '📦 New Product Ready to Order',
                     "{$approval['product_name']} needs initial order of {$qty} units.",
-                    'info',
-                    'info'
+                    'info', 'info'
                 );
             }
 
@@ -317,8 +325,7 @@ if ($method === 'PUT') {
                     (int)$approval['requested_by'],
                     '❌ Product Request Rejected',
                     "Your request for '{$approval['product_name']}' was rejected." . ($notes ? " Reason: {$notes}" : ''),
-                    'error',
-                    'error'
+                    'error', 'error'
                 );
             }
             $conn->commit();
