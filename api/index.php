@@ -70,6 +70,7 @@ $apiFiles = [
     'suppliers'                  => 'suppliers.php',
     'supplier_invoices'          => 'supplier_invoices.php',
     'supplier_performance'       => 'supplier_performance.php',
+    'supplier_ratings'           => 'supplier_ratings.php',   // ✅ ADDED
     'supply_chain'               => 'supply_chain.php',
     'supply_chain_notifications' => 'supply_chain_notifications.php',
     'transactions'               => 'transactions.php',
@@ -89,7 +90,7 @@ if (isset($apiFiles[$endpoint])) {
 } else {
     http_response_code(404);
     echo json_encode([
-        'success' => false, 
+        'success' => false,
         'message' => 'Invalid API endpoint: ' . $endpoint,
         'available_endpoints' => array_keys($apiFiles)
     ]);
