@@ -9,6 +9,7 @@
 // ✅ Auto-create PO on order
 // ✅ Auto-create GRN on receive
 // ✅ Supplier notify on unavailable
+// ✅ Fixed: consistent named params in paid/completed handlers
 // ============================================
 
 header('Content-Type: application/json');
@@ -220,7 +221,6 @@ try {
             exit();
         }
 
-        // Q1=B : Only Staff, Admin, Super Admin can create
         require_role($conn, $requestedBy, ['staff', 'admin', 'super_admin'], 'creating a request');
 
         $conn->beginTransaction();
@@ -329,12 +329,10 @@ try {
             $req = $stmt->fetch(PDO::FETCH_ASSOC);
             if (!$req) throw new Exception('Supply chain request not found');
 
-            // Transition guard
             if (!allowed_transitions($req['status'], $status)) {
                 throw new Exception("Illegal transition: {$req['status']} → {$status}");
             }
 
-            // Role guard per action
             if (in_array($status, ['approved','rejected'], true)) {
                 require_role($conn, $actor, ['finance', 'admin', 'super_admin'], 'approving or rejecting');
             }
@@ -481,7 +479,7 @@ try {
                 }
             }
 
-            // UNAVAILABLE → notify Staff + Finance (C2=B)
+            // UNAVAILABLE → notify Staff + Finance
             if ($status === 'unavailable') {
                 $reasonTxt = $rejectReason ?: 'Supplier has no stock';
                 if (function_exists('createNotification')) {
@@ -550,19 +548,27 @@ try {
                 }
             }
 
-            // PAID → update PO payment status + notify (A+B+C merged)
+            // PAID → update PO payment status + notify
+            // ✅ FIXED: all params use named syntax (no mixed ? and :name)
             if ($status === 'paid') {
                 $method    = trim((string)($input['payment_method'] ?? 'paymongo'));
                 $reference = trim((string)($input['payment_reference'] ?? ''));
 
                 $upd = $conn->prepare("
                     UPDATE purchase_orders
-                    SET lifecycle_status='paid', payment_status='paid',
-                        payment_method=:pm, payment_reference=:pr,
-                        amount_paid=total_cost, updated_at=NOW()
-                    WHERE requisition_id=?
+                    SET lifecycle_status = 'paid',
+                        payment_status   = 'paid',
+                        payment_method   = :pm,
+                        payment_reference = :pr,
+                        amount_paid      = total_cost,
+                        updated_at       = NOW()
+                    WHERE requisition_id = :req
                 ");
-                $upd->execute([':pm' => $method, ':pr' => $reference, ':req' => $id]);
+                $upd->execute([
+                    ':pm'  => $method,
+                    ':pr'  => $reference,
+                    ':req' => $id,
+                ]);
 
                 if (function_exists('notifyRole')) {
                     notifyRole(
@@ -576,13 +582,20 @@ try {
             }
 
             // COMPLETED → close PO
+            // ✅ FIXED: all params use named syntax (no mixed ? and :name)
             if ($status === 'completed') {
                 $upd = $conn->prepare("
                     UPDATE purchase_orders
-                    SET lifecycle_status='closed', closed_at=NOW(), closed_by=:cb, updated_at=NOW()
-                    WHERE requisition_id=?
+                    SET lifecycle_status = 'closed',
+                        closed_at        = NOW(),
+                        closed_by        = :cb,
+                        updated_at       = NOW()
+                    WHERE requisition_id = :req
                 ");
-                $upd->execute([':cb' => $actor, ':req' => $id]);
+                $upd->execute([
+                    ':cb'  => $actor,
+                    ':req' => $id,
+                ]);
             }
 
             $conn->commit();
