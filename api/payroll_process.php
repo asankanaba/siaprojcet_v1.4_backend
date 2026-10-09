@@ -88,7 +88,7 @@ function dateRange(string $start, string $end): array {
 }
 
 /**
- * Resolve shift config for a user (merge A/B/C per Q1)
+ * Resolve shift config for a user
  * Priority:
  *  1. users.shift_start / users.grace_minutes / users.work_hours_per_day
  *  2. shift_schedules row (most recent active)
@@ -133,14 +133,20 @@ function resolveShift(PDO $conn, array $user): array {
 
 /**
  * Compute the deduction for a late day.
- * Late = (actual clock_in) - (shift_start + grace). Deduct that in hours × hourly rate.
+ * Late = (actual clock_in) - (shift_start + grace). Deduct in hours × hourly rate.
  */
-function computeLateDeduction(string $clockInTime, string $shiftStart, int $graceMinutes, float $dailyRate, float $workHours): float {
+function computeLateDeduction(
+    string $clockInTime,
+    string $shiftStart,
+    int $graceMinutes,
+    float $dailyRate,
+    float $workHours
+): float {
     $shiftStartTs = strtotime($shiftStart);
     $clockInTs    = strtotime($clockInTime);
     if (!$shiftStartTs || !$clockInTs) return 0.0;
 
-    $lateSeconds = $clockInTs - $shiftStartTs;
+    $lateSeconds  = $clockInTs - $shiftStartTs;
     $graceSeconds = $graceMinutes * 60;
 
     if ($lateSeconds <= $graceSeconds) return 0.0;
@@ -185,13 +191,14 @@ try {
         exit();
     }
 
+    $today = date('Y-m-d'); // Used to check if a date is in the past
+
     // ============================================
     // RESOLVE EMPLOYEE LIST
     // ============================================
     if (is_array($employeeIds) && count($employeeIds) > 0) {
         $ids = array_map('intval', $employeeIds);
     } else {
-        // All active employees with attendance in the period
         $stmt = $conn->prepare("
             SELECT DISTINCT user_id FROM attendance
             WHERE date BETWEEN ? AND ?
@@ -204,12 +211,16 @@ try {
         echo json_encode([
             'success' => true,
             'message' => 'No employees to process',
-            'data'    => ['processed' => 0, 'details' => [], 'summary' => [
-                'total_employees' => 0,
-                'total_deductions' => 0,
-                'total_net_pay' => 0,
-                'total_records' => 0,
-            ]],
+            'data'    => [
+                'processed' => 0,
+                'details'   => [],
+                'summary'   => [
+                    'total_employees'  => 0,
+                    'total_deductions' => 0,
+                    'total_net_pay'    => 0,
+                    'total_records'    => 0,
+                ],
+            ],
         ]);
         exit();
     }
@@ -246,10 +257,10 @@ try {
     // ============================================
     // PROCESS EACH EMPLOYEE
     // ============================================
-    $details          = [];
-    $totalDeductions  = 0.0;
-    $totalNetPay      = 0.0;
-    $processedCount   = 0;
+    $details         = [];
+    $totalDeductions = 0.0;
+    $totalNetPay     = 0.0;
+    $processedCount  = 0;
 
     $conn->beginTransaction();
 
@@ -266,15 +277,15 @@ try {
             $user = $uStmt->fetch(PDO::FETCH_ASSOC);
             if (!$user) continue;
 
-            // 2. Resolve shift (Q1: merge logic)
+            // 2. Resolve shift
             $shift = resolveShift($conn, $user);
 
             $dailyRate = (float)($user['salary_rate'] ?? 0);
             $salType   = $user['salary_type'] ?? 'daily';
 
-            // Only handle daily rate for now (hourly/monthly can come later)
+            // Convert non-daily rates to daily equivalent
             if ($salType === 'monthly') {
-                $dailyRate = $dailyRate / 22; // approximate 22 working days
+                $dailyRate = $dailyRate / 22;
             } elseif ($salType === 'hourly') {
                 $dailyRate = $dailyRate * $shift['work_hours_per_day'];
             }
@@ -296,7 +307,10 @@ try {
             }
 
             // 4. Check leave coverage for this user
-            $userLeaves = array_filter($approvedLeaves, fn($l) => (int)$l['user_id'] === (int)$userId);
+            $userLeaves = array_filter(
+                $approvedLeaves,
+                fn($l) => (int)$l['user_id'] === (int)$userId
+            );
             $leaveDates = [];
             foreach ($userLeaves as $l) {
                 foreach (dateRange($l['start_date'], $l['end_date']) as $d) {
@@ -307,13 +321,13 @@ try {
             }
 
             // 5. Iterate every date in period
-            $daysPresent  = 0;
-            $daysLate     = 0;
-            $daysAbsent   = 0;
-            $basicSalary  = 0.0;
-            $holidayPay   = 0.0;
-            $leavePay     = 0.0;
-            $deductions   = 0.0;
+            $daysPresent = 0;
+            $daysLate    = 0;
+            $daysAbsent  = 0;
+            $basicSalary = 0.0;
+            $holidayPay  = 0.0;
+            $leavePay    = 0.0;
+            $deductions  = 0.0;
 
             foreach (dateRange($periodStart, $periodEnd) as $date) {
                 $isHoliday = isset($holidays[$date]);
@@ -327,7 +341,6 @@ try {
                 if ($isHoliday) {
                     $mult = $holidays[$date]['multiplier'];
                     $holidayPay += $dailyRate * $mult;
-                    // If also worked that day, still count as present
                     if (isset($attByDate[$date])) $daysPresent++;
                     continue;
                 }
@@ -340,12 +353,12 @@ try {
 
                 // Regular day (weekday, no holiday, no leave)
                 if (isset($attByDate[$date])) {
-                    $att = $attByDate[$date];
+                    $att    = $attByDate[$date];
                     $status = strtolower($att['status'] ?? 'present');
 
                     if ($status === 'absent') {
                         $daysAbsent++;
-                        $deductions += $dailyRate; // full day
+                        $deductions += $dailyRate;
                         continue;
                     }
 
@@ -366,14 +379,17 @@ try {
                         $daysPresent++;
                     }
                 } else {
-                    // No attendance, not on leave, not a holiday → absent
-                    $daysAbsent++;
-                    $deductions += $dailyRate;
+                    // ✅ FIX: Only count as absent if the date is in the PAST.
+                    // Future/current days with no attendance are simply skipped.
+                    if ($date < $today) {
+                        $daysAbsent++;
+                        $deductions += $dailyRate;
+                    }
                 }
             }
 
-            $gross    = $basicSalary + $holidayPay + $leavePay;
-            $netPay   = max(0, $gross - $deductions);
+            $gross  = $basicSalary + $holidayPay + $leavePay;
+            $netPay = max(0, $gross - $deductions);
 
             // 6. Insert / upsert payroll row
             $check = $conn->prepare("
@@ -429,20 +445,20 @@ try {
 
             // 7. Track totals
             $details[] = [
-                'user_id'        => $userId,
-                'payroll_id'     => $payrollId,
-                'full_name'      => $user['full_name'],
-                'department'     => $user['department'],
-                'days_present'   => $daysPresent,
-                'days_late'      => $daysLate,
-                'days_absent'    => $daysAbsent,
-                'basic_salary'   => round($basicSalary, 2),
-                'holiday_pay'    => round($holidayPay, 2),
-                'leave_pay'      => round($leavePay, 2),
-                'gross_pay'      => round($gross, 2),
-                'deductions'     => round($deductions, 2),
-                'net_pay'        => round($netPay, 2),
-                'status'         => 'pending',
+                'user_id'      => $userId,
+                'payroll_id'   => $payrollId,
+                'full_name'    => $user['full_name'],
+                'department'   => $user['department'],
+                'days_present' => $daysPresent,
+                'days_late'    => $daysLate,
+                'days_absent'  => $daysAbsent,
+                'basic_salary' => round($basicSalary, 2),
+                'holiday_pay'  => round($holidayPay, 2),
+                'leave_pay'    => round($leavePay, 2),
+                'gross_pay'    => round($gross, 2),
+                'deductions'   => round($deductions, 2),
+                'net_pay'      => round($netPay, 2),
+                'status'       => 'pending',
             ];
 
             $totalDeductions += $deductions;
@@ -450,7 +466,7 @@ try {
             $processedCount++;
         }
 
-        // 8. Also record the period in payroll_periods (if table exists)
+        // 8. Record the period in payroll_periods (if table exists)
         try {
             $ppChk = $conn->prepare("
                 SELECT id FROM payroll_periods
@@ -465,7 +481,7 @@ try {
                 ");
                 $ppIns->execute([$periodType, $periodStart, $periodEnd, $createdBy]);
             }
-        } catch (Throwable $e) { /* payroll_periods optional */ }
+        } catch (Throwable $e) { /* optional */ }
 
         // 9. Notify Finance
         notifyRole(
