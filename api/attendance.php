@@ -167,7 +167,7 @@ function sendAttendanceNotification($conn, $user_id, $action, $status, $time, $h
 $method = $_SERVER['REQUEST_METHOD'];
 $id = isset($_GET['id']) ? $_GET['id'] : null;
 $user_id = isset($_GET['user_id']) ? $_GET['user_id'] : null;
-$date = isset($_GET['date']) ? $_GET['date'] : date('Y-m-d');
+$date = isset($_GET['date']) ? $_GET['date'] : null;   // ✅ FIXED: default to NULL (was date('Y-m-d'))
 $status = isset($_GET['status']) ? $_GET['status'] : '';
 $month = isset($_GET['month']) ? (int)$_GET['month'] : (int)date('m');
 $year = isset($_GET['year']) ? (int)$_GET['year'] : (int)date('Y');
