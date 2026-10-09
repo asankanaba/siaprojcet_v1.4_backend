@@ -14,6 +14,7 @@
 //      - refund.succeeded
 //      - link.payment.paid
 //    ✅ Updates linked supply_chain_requests when payment succeeds
+//    ✅ Also updates supplier_invoices + logs transactions
 // ============================================================
 declare(strict_types=1);
 
@@ -244,6 +245,7 @@ function handle_payment_paid(PDO $conn, string $eventType, array $eventData): ar
 
     $conn->beginTransaction();
     try {
+        // 1. Mark payment as succeeded
         $conn->prepare("
             UPDATE payments
             SET status = 'succeeded',
@@ -263,7 +265,7 @@ function handle_payment_paid(PDO $conn, string $eventType, array $eventData): ar
             $pay['id'],
         ]);
 
-        // ✅ Update PO
+        // 2. Update purchase_orders + linked supply_chain_requests
         if (!empty($pay['po_id'])) {
             $conn->prepare("
                 UPDATE purchase_orders
@@ -279,26 +281,32 @@ function handle_payment_paid(PDO $conn, string $eventType, array $eventData): ar
                 (int)$pay['po_id'],
             ]);
 
-            // ✅ NEW: Update the linked supply_chain_requests row
-            $conn->prepare("
+            // ✅ Update linked supply_chain_requests — broader status filter
+            $updReq = $conn->prepare("
                 UPDATE supply_chain_requests r
                 JOIN purchase_orders po ON po.requisition_id = r.id
                 SET r.status     = 'paid',
-                    r.paid_by    = po.ordered_by,
+                    r.paid_by    = COALESCE(r.paid_by, po.ordered_by),
                     r.paid_at    = COALESCE(r.paid_at, NOW()),
                     r.updated_at = NOW()
                 WHERE po.id = ?
-                  AND r.status IN ('received', 'ordered')
-            ")->execute([(int)$pay['po_id']]);
+                  AND r.status NOT IN ('completed', 'rejected', 'cancelled', 'unavailable')
+            ");
+            $updReq->execute([(int)$pay['po_id']]);
+
+            paymongo_log('info', "Webhook: updated supply_chain_requests for PO", [
+                'po_id'        => (int)$pay['po_id'],
+                'rows_changed' => $updReq->rowCount(),
+            ]);
         }
 
-        // ✅ Update supplier invoice
+        // 3. Update supplier invoice if present
         if (!empty($pay['invoice_id'])) {
             $conn->prepare("UPDATE supplier_invoices SET status = 'paid' WHERE id = ?")
                  ->execute([(int)$pay['invoice_id']]);
         }
 
-        // Expense transaction
+        // 4. Log expense transaction
         $conn->prepare("
             INSERT INTO transactions
                 (description, amount, type, category, date, status, reference)
@@ -309,6 +317,7 @@ function handle_payment_paid(PDO $conn, string $eventType, array $eventData): ar
             $pay['payment_ref'],
         ]);
 
+        // 5. Notify roles
         notifyRole(
             $conn,
             ['finance','supply_chain','super_admin','admin'],
