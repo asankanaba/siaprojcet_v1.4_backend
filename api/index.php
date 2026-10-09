@@ -16,7 +16,6 @@ error_reporting(E_ALL);
 ini_set('display_errors', 0);
 ini_set('log_errors', 1);
 
-// Get the endpoint from query parameter or path
 $endpoint = isset($_GET['endpoint']) ? $_GET['endpoint'] : null;
 
 if (!$endpoint) {
@@ -28,7 +27,6 @@ if (!$endpoint) {
 
 $endpoint = str_replace('.php', '', $endpoint);
 
-// Map endpoints to files — COMPLETE list
 $apiFiles = [
     'analytics'                  => 'analytics.php',
     'attendance'                 => 'attendance.php',
@@ -45,18 +43,19 @@ $apiFiles = [
     'export_hr_excel'            => 'export_hr_excel.php',
     'finance_dashboard'          => 'finance_dashboard.php',
     'goals'                      => 'goals.php',
-    'holidays'                   => 'holidays.php',              // ✅ ADDED
+    'holidays'                   => 'holidays.php',
     'hr_dashboard'               => 'hr_dashboard.php',
     'hr_reports'                 => 'hr_reports.php',
     'image'                      => 'image.php',
     'jobs'                       => 'jobs.php',
-    'leave_requests'             => 'leave_requests.php',        // ✅ ADDED
+    'leave_requests'             => 'leave_requests.php',
     'notifications'              => 'notifications.php',
     'payments'                   => 'payments.php',
     'paymongo_return'            => 'paymongo_return.php',
     'paymongo_webhook'           => 'paymongo_webhook.php',
     'payroll'                    => 'payroll.php',
     'payroll_process'            => 'payroll_process.php',
+    'ping'                       => 'ping.php',
     'po_deliveries'              => 'po_deliveries.php',
     'products'                   => 'products.php',
     'product_approvals'          => 'product_approvals.php',
@@ -65,7 +64,7 @@ $apiFiles = [
     'reports'                    => 'reports.php',
     'requisitions'               => 'requisitions.php',
     'rfqs'                       => 'rfqs.php',
-    'salary_history'             => 'salary_history.php',        // ✅ ADDED
+    'salary_history'             => 'salary_history.php',
     'sales'                      => 'sales.php',
     'settings'                   => 'settings.php',
     'shift_schedules'            => 'shift_schedules.php',
