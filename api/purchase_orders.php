@@ -1,8 +1,8 @@
 <?php
 // ============================================================
 // 📁 File: api/purchase_orders.php
-// 📦 Purchase Orders API — Phase 3 (payment-aware)
-// 🔧 + actions: pay, close, record_grn
+// 📦 Purchase Orders API — full lifecycle
+// 🔧 Actions: create, pay, close, GRN via /po_deliveries.php
 // ============================================================
 declare(strict_types=1);
 
@@ -59,12 +59,12 @@ try {
                 $row = $conn->query("
                     SELECT
                         COUNT(*) AS total_count,
-                        SUM(CASE WHEN status IN ('draft','ordered')     THEN 1 ELSE 0 END) AS pending_count,
-                        SUM(CASE WHEN status = 'shipped'                THEN 1 ELSE 0 END) AS shipped_count,
-                        SUM(CASE WHEN status = 'received'               THEN 1 ELSE 0 END) AS received_count,
-                        SUM(CASE WHEN status = 'cancelled'              THEN 1 ELSE 0 END) AS cancelled_count,
-                        COALESCE(SUM(total_cost), 0)                    AS total_spent,
-                        COALESCE(SUM(amount_paid), 0)                   AS total_paid,
+                        SUM(CASE WHEN status IN ('draft','ordered') THEN 1 ELSE 0 END) AS pending_count,
+                        SUM(CASE WHEN status = 'shipped'  THEN 1 ELSE 0 END) AS shipped_count,
+                        SUM(CASE WHEN status = 'received' THEN 1 ELSE 0 END) AS received_count,
+                        SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled_count,
+                        COALESCE(SUM(total_cost), 0)  AS total_spent,
+                        COALESCE(SUM(amount_paid), 0) AS total_paid,
                         COALESCE(SUM(CASE WHEN payment_status = 'unpaid'  THEN total_cost ELSE 0 END), 0) AS unpaid_amount,
                         COALESCE(SUM(CASE WHEN payment_status = 'partial' THEN total_cost - amount_paid ELSE 0 END), 0) AS partial_balance,
                         SUM(CASE WHEN payment_status = 'unpaid'  THEN 1 ELSE 0 END) AS unpaid_count,
@@ -111,8 +111,8 @@ try {
                 $days = max(7, min(365, (int)($_GET['days'] ?? 30)));
                 $stmt = $conn->prepare("
                     SELECT DATE(ordered_date) AS day,
-                           COUNT(*)           AS orders,
-                           COALESCE(SUM(total_cost), 0)  AS spend
+                           COUNT(*) AS orders,
+                           COALESCE(SUM(total_cost), 0) AS spend
                     FROM purchase_orders
                     WHERE ordered_date >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
                     GROUP BY DATE(ordered_date)
@@ -227,10 +227,10 @@ try {
                 $po_id = (int)($input['po_id'] ?? 0);
                 if ($po_id <= 0) throw new InvalidArgumentException('po_id required');
 
-                $method = trim((string)($input['payment_method'] ?? 'paymongo'));
-                $ref    = trim((string)($input['payment_reference'] ?? ''));
-                $amount = (float)($input['amount'] ?? 0);
-                $paidBy = $user['id'] ?? (int)($input['paid_by'] ?? 0);
+                $methodName = trim((string)($input['payment_method'] ?? 'paymongo'));
+                $ref        = trim((string)($input['payment_reference'] ?? ''));
+                $amount     = (float)($input['amount'] ?? 0);
+                $paidBy     = $user['id'] ?? (int)($input['paid_by'] ?? 0);
 
                 $conn->beginTransaction();
                 try {
@@ -275,7 +275,7 @@ try {
                         ':po'  => $po_id,
                         ':sid' => (int)$po['supplier_id'],
                         ':amt' => $pay,
-                        ':pm'  => $method,
+                        ':pm'  => $methodName,
                         ':ref' => $ref,
                         ':by'  => $paidBy ?: null,
                     ]);
@@ -291,15 +291,16 @@ try {
                             updated_at        = NOW()
                         WHERE id = ?
                     ");
-                    $upd->execute([$newStatus, $method, $ref, $newPaid, $newLifecycle, $po_id]);
+                    $upd->execute([$newStatus, $methodName, $ref, $newPaid, $newLifecycle, $po_id]);
 
+                    // Cascade to requisition
                     if ($newStatus === 'paid') {
                         $conn->prepare("
-                            UPDATE supply_chain_requests r
+                            UPDATE requisitions r
                             JOIN purchase_orders po ON po.requisition_id = r.id
-                            SET r.status = 'paid', r.paid_by = ?, r.paid_at = NOW(), r.updated_at = NOW()
+                            SET r.status = 'paid', r.updated_at = NOW()
                             WHERE po.id = ?
-                        ")->execute([$paidBy ?: null, $po_id]);
+                        ")->execute([$po_id]);
                     }
 
                     $conn->commit();
@@ -309,7 +310,7 @@ try {
                             $conn,
                             ['finance', 'supply_chain', 'super_admin', 'admin'],
                             '💰 Payment Recorded — ' . $po['po_number'],
-                            'Paid ₱' . number_format($pay, 2) . ' via ' . $method,
+                            'Paid ₱' . number_format($pay, 2) . ' via ' . $methodName,
                             'success', 'success'
                         );
                     }
@@ -360,7 +361,7 @@ try {
                 $upd->execute([$closedBy ?: null, $po_id]);
 
                 $conn->prepare("
-                    UPDATE supply_chain_requests r
+                    UPDATE requisitions r
                     JOIN purchase_orders po ON po.requisition_id = r.id
                     SET r.status = 'completed', r.updated_at = NOW()
                     WHERE po.id = ?
@@ -370,100 +371,18 @@ try {
             }
 
             // ========================================================
-            // ACTION: record_grn
+            // ACTION: record_grn — DEPRECATED
             // ========================================================
             if (($_GET['action'] ?? '') === 'record_grn') {
-                $po_id  = (int)($input['po_id'] ?? 0);
-                $qty    = (int)($input['qty_received'] ?? 0);
-                $recvBy = $user['id'] ?? (int)($input['received_by'] ?? 0);
-                $notes  = trim((string)($input['condition_notes'] ?? ''));
-
-                if ($po_id <= 0 || $qty <= 0) {
-                    throw new InvalidArgumentException('po_id and qty_received required');
-                }
-                if ($recvBy <= 0) throw new InvalidArgumentException('received_by or authenticated user required');
-
-                $conn->beginTransaction();
-                try {
-                    $p = $conn->prepare("
-                        SELECT id, po_number, product_id, quantity, lifecycle_status, status
-                        FROM purchase_orders WHERE id = ? FOR UPDATE
-                    ");
-                    $p->execute([$po_id]);
-                    $po = $p->fetch(PDO::FETCH_ASSOC);
-                    if (!$po) throw new InvalidArgumentException('PO not found');
-
-                    if (in_array($po['lifecycle_status'], ['paid','closed','cancelled'], true)) {
-                        throw new InvalidArgumentException('Cannot receive a ' . $po['lifecycle_status'] . ' PO');
-                    }
-
-                    $grnNumber = 'GRN-' . date('Ymd') . '-' . rand(1000, 9999);
-                    $status    = ($qty >= (int)$po['quantity']) ? 'complete' : 'partial';
-
-                    $g = $conn->prepare("
-                        INSERT INTO po_deliveries
-                            (po_id, grn_number, received_by, qty_ordered,
-                             qty_received, qty_rejected, condition_notes, status)
-                        VALUES (?, ?, ?, ?, ?, 0, ?, ?)
-                    ");
-                    $g->execute([$po_id, $grnNumber, $recvBy, (int)$po['quantity'], $qty, $notes, $status]);
-                    $grnId = (int)$conn->lastInsertId();
-
-                    $conn->prepare("
-                        UPDATE purchase_orders
-                        SET lifecycle_status = 'grn_posted', status = 'received',
-                            received_date = NOW(), updated_at = NOW()
-                        WHERE id = ?
-                    ")->execute([$po_id]);
-
-                    $conn->prepare("UPDATE products SET stock = stock + ? WHERE id = ?")
-                         ->execute([$qty, (int)$po['product_id']]);
-
-                    try {
-                        $conn->prepare("
-                            INSERT INTO inventory_logs (product_id, quantity_change, type, note, user_id)
-                            VALUES (?, ?, 'restock', ?, ?)
-                        ")->execute([
-                            (int)$po['product_id'], $qty,
-                            "GRN {$grnNumber} for PO {$po['po_number']}",
-                            $recvBy,
-                        ]);
-                    } catch (Throwable $ignored) {}
-
-                    $conn->prepare("
-                        UPDATE supply_chain_requests r
-                        JOIN purchase_orders po ON po.requisition_id = r.id
-                        SET r.status = 'received',
-                            r.received_by = ?, r.received_at = NOW(), r.received_date = NOW(),
-                            r.updated_at = NOW()
-                        WHERE po.id = ?
-                    ")->execute([$recvBy, $po_id]);
-
-                    $conn->commit();
-
-                    if (function_exists('notifyRole')) {
-                        notifyRole(
-                            $conn,
-                            ['finance', 'supply_chain', 'super_admin', 'admin'],
-                            '📦 Delivery Received — ' . $po['po_number'],
-                            $qty . ' of ' . $po['quantity'] . ' units received. GRN ' . $grnNumber,
-                            'info', 'info'
-                        );
-                    }
-
-                    respond_json([
-                        'success'    => true,
-                        'grn_id'     => $grnId,
-                        'grn_number' => $grnNumber,
-                        'status'     => $status,
-                    ]);
-                } catch (Throwable $e) {
-                    $conn->rollBack();
-                    throw $e;
-                }
+                respond_json([
+                    'success' => false,
+                    'message' => 'Deprecated. Use POST /api/po_deliveries.php to post a GRN.'
+                ], 410);
             }
 
-            // ---- default: create ----
+            // ========================================================
+            // default: CREATE Purchase Order
+            // ========================================================
             $required = ['product_id','supplier_id','quantity','unit_price'];
             foreach ($required as $f) {
                 if (empty($input[$f])) throw new InvalidArgumentException("Missing required field: $f");
@@ -477,9 +396,50 @@ try {
             $total_cost = $quantity * $unit_price;
             $po_number  = 'PO-' . date('Ymd') . '-' . rand(1000, 9999);
             $ordered_by = $user['id'] ?? (int)$input['ordered_by'];
+            $reqId      = !empty($input['requisition_id']) ? (int)$input['requisition_id'] : null;
 
             $conn->beginTransaction();
             try {
+                // Validate requisition
+                if ($reqId) {
+                    $rq = $conn->prepare("
+                        SELECT id, status, estimated_total, product_id, quantity
+                        FROM requisitions
+                        WHERE id = ? FOR UPDATE
+                    ");
+                    $rq->execute([$reqId]);
+                    $req = $rq->fetch(PDO::FETCH_ASSOC);
+
+                    if (!$req) {
+                        throw new InvalidArgumentException("Requisition #$reqId not found");
+                    }
+                    if ($req['status'] !== 'approved') {
+                        throw new InvalidArgumentException(
+                            "Cannot create PO: requisition is '{$req['status']}'. " .
+                            "Only approved requisitions can be converted."
+                        );
+                    }
+                }
+
+                // Validate supplier
+                $supChk = $conn->prepare("SELECT id, status FROM suppliers WHERE id = ?");
+                $supChk->execute([(int)$input['supplier_id']]);
+                $supplier = $supChk->fetch(PDO::FETCH_ASSOC);
+                if (!$supplier) {
+                    throw new InvalidArgumentException("Supplier not found");
+                }
+                if ($supplier['status'] !== 'active') {
+                    throw new InvalidArgumentException("Supplier is not active (status: {$supplier['status']})");
+                }
+
+                // Validate product
+                $prodChk = $conn->prepare("SELECT id FROM products WHERE id = ?");
+                $prodChk->execute([(int)$input['product_id']]);
+                if (!$prodChk->fetch()) {
+                    throw new InvalidArgumentException("Product not found");
+                }
+
+                // Insert PO
                 $stmt = $conn->prepare("
                     INSERT INTO purchase_orders
                         (po_number, requisition_id, product_id, supplier_id, quantity, unit_price,
@@ -489,7 +449,7 @@ try {
                 ");
                 $stmt->execute([
                     $po_number,
-                    !empty($input['requisition_id']) ? (int)$input['requisition_id'] : null,
+                    $reqId,
                     (int)$input['product_id'],
                     (int)$input['supplier_id'],
                     $quantity,
@@ -504,8 +464,14 @@ try {
                 ]);
                 $orderId = (int)$conn->lastInsertId();
 
-                $conn->prepare("UPDATE suppliers SET stock_available = stock_available - ? WHERE id = ?")
-                     ->execute([$quantity, (int)$input['supplier_id']]);
+                // Mark requisition converted
+                if ($reqId) {
+                    $conn->prepare("
+                        UPDATE requisitions
+                        SET status = 'converted_to_po'
+                        WHERE id = ?
+                    ")->execute([$reqId]);
+                }
 
                 if (function_exists('notifyRole')) {
                     notifyRole(
@@ -523,7 +489,12 @@ try {
                 throw $e;
             }
 
-            respond_json(['success' => true, 'id' => $orderId, 'po_number' => $po_number]);
+            respond_json([
+                'success'            => true,
+                'id'                 => $orderId,
+                'po_number'          => $po_number,
+                'requisition_linked' => !empty($reqId)
+            ]);
             break;
 
 

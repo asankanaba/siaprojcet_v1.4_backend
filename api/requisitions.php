@@ -1,5 +1,12 @@
 <?php
-// api/requisitions.php
+// ============================================================
+// 📁 File: api/requisitions.php
+// 🎯 Budget-aware requisition lifecycle
+//
+// Lifecycle: pending_finance → approved → converted_to_po → paid
+//                              ↘ rejected
+//                              ↘ cancelled (refunds budget)
+// ============================================================
 header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
@@ -19,7 +26,7 @@ try {
     switch ($method) {
 
         // ============================================
-        // GET — list or single
+        // GET
         // ============================================
         case 'GET':
             if (isset($_GET['id'])) {
@@ -27,11 +34,14 @@ try {
                     SELECT r.*,
                            u.full_name AS requested_by_name,
                            a.full_name AS approved_by_name,
-                           p.name AS product_name_real
+                           p.name AS product_name_real,
+                           po.po_number AS po_number,
+                           po.id AS po_id
                     FROM requisitions r
                     LEFT JOIN users u ON r.requested_by = u.id
                     LEFT JOIN users a ON r.approved_by = a.id
                     LEFT JOIN products p ON r.product_id = p.id
+                    LEFT JOIN purchase_orders po ON po.requisition_id = r.id
                     WHERE r.id = ?
                 ");
                 $stmt->execute([$_GET['id']]);
@@ -43,11 +53,14 @@ try {
                 SELECT r.*,
                        u.full_name AS requested_by_name,
                        a.full_name AS approved_by_name,
-                       p.name AS product_name_real
+                       p.name AS product_name_real,
+                       po.po_number AS po_number,
+                       po.id AS po_id
                 FROM requisitions r
                 LEFT JOIN users u ON r.requested_by = u.id
                 LEFT JOIN users a ON r.approved_by = a.id
                 LEFT JOIN products p ON r.product_id = p.id
+                LEFT JOIN purchase_orders po ON po.requisition_id = r.id
             ";
             $where = []; $params = [];
 
@@ -73,7 +86,7 @@ try {
             break;
 
         // ============================================
-        // POST — create requisition
+        // POST — create requisition WITH BUDGET CHECK
         // ============================================
         case 'POST':
             $required = ['requested_by', 'quantity'];
@@ -84,19 +97,49 @@ try {
             $qty   = (int)$input['quantity'];
             $unit  = (float)($input['estimated_unit_cost'] ?? 0);
             $total = $qty * $unit;
+            $dept  = $input['department'] ?? 'General';
+
+            // ---- Find active budget for department ----
+            $b = $conn->prepare("
+                SELECT id, allocated_amount, spent_amount, status
+                FROM budgets
+                WHERE category = ? AND status IN ('active','exhausted')
+                LIMIT 1
+            ");
+            $b->execute([$dept]);
+            $budget = $b->fetch(PDO::FETCH_ASSOC);
+
+            if (!$budget) {
+                throw new Exception(
+                    "No active budget found for department: $dept. " .
+                    "Please ask Finance to allocate a budget first."
+                );
+            }
+
+            // ---- Check remaining budget ----
+            $remaining = (float)$budget['allocated_amount'] - (float)$budget['spent_amount'];
+            if ($total > $remaining) {
+                throw new Exception(
+                    "Insufficient budget for $dept. " .
+                    "Requested: ₱" . number_format($total, 2) . ", " .
+                    "Remaining: ₱" . number_format($remaining, 2)
+                );
+            }
+
             $reqNo = 'REQ-' . date('Ymd') . '-' . rand(1000, 9999);
 
             $stmt = $conn->prepare("
                 INSERT INTO requisitions
-                    (req_number, requested_by, department, product_id, product_name,
+                    (req_number, requested_by, department, budget_id, product_id, product_name,
                      quantity, estimated_unit_cost, estimated_total, cost_center,
                      justification, urgency, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_finance')
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_finance')
             ");
             $stmt->execute([
                 $reqNo,
                 (int)$input['requested_by'],
-                $input['department'] ?? 'General',
+                $dept,
+                (int)$budget['id'],
                 !empty($input['product_id']) ? (int)$input['product_id'] : null,
                 $input['product_name'] ?? null,
                 $qty,
@@ -109,27 +152,30 @@ try {
 
             $id = $conn->lastInsertId();
 
-            // Notify all finance users
-            notifyRole(
-                $conn,
-                ['finance', 'super_admin', 'admin'],
-                '📋 New Requisition ' . $reqNo,
-                'A new requisition for ' . ($input['product_name'] ?? 'item') .
-                ' x' . $qty . ' (₱' . number_format($total, 2) . ') needs budget approval.',
-                'warning',
-                'warning',
-                (int)$input['requested_by']
-            );
+            // Notify finance
+            if (function_exists('notifyRole')) {
+                notifyRole(
+                    $conn,
+                    ['finance', 'super_admin', 'admin'],
+                    '📋 New Requisition ' . $reqNo,
+                    'New requisition for ' . ($input['product_name'] ?? 'item') .
+                    ' x' . $qty . ' (₱' . number_format($total, 2) . ') needs approval.',
+                    'warning',
+                    'warning',
+                    (int)$input['requested_by']
+                );
+            }
 
             echo json_encode([
-                'success'    => true,
-                'id'         => $id,
-                'req_number' => $reqNo
+                'success'          => true,
+                'id'               => $id,
+                'req_number'       => $reqNo,
+                'budget_remaining' => number_format($remaining - $total, 2, '.', '')
             ]);
             break;
 
         // ============================================
-        // PUT — approve / reject / cancel
+        // PUT — approve / reject / cancel / convert
         // ============================================
         case 'PUT':
             $id = $_GET['id'] ?? null;
@@ -137,33 +183,90 @@ try {
 
             $action = $input['action'] ?? null;
 
+            // -------- APPROVE --------
             if ($action === 'approve') {
-                $stmt = $conn->prepare("
-                    UPDATE requisitions
-                    SET status = 'approved',
-                        approved_by = ?,
-                        approved_at = NOW()
-                    WHERE id = ? AND status = 'pending_finance'
-                ");
-                $stmt->execute([(int)$input['approved_by'], $id]);
+                $conn->beginTransaction();
+                try {
+                    $r = $conn->prepare("
+                        SELECT r.*,
+                               b.id AS b_id, b.allocated_amount, b.spent_amount
+                        FROM requisitions r
+                        LEFT JOIN budgets b ON r.budget_id = b.id
+                        WHERE r.id = ? FOR UPDATE
+                    ");
+                    $r->execute([$id]);
+                    $req = $r->fetch(PDO::FETCH_ASSOC);
 
-                // Fetch row for notification
-                $r = $conn->prepare("SELECT requested_by, req_number FROM requisitions WHERE id = ?");
-                $r->execute([$id]);
-                $row = $r->fetch(PDO::FETCH_ASSOC);
+                    if (!$req) throw new Exception('Requisition not found');
+                    if ($req['status'] !== 'pending_finance') {
+                        throw new Exception("Cannot approve. Requisition is already '{$req['status']}'");
+                    }
 
-                if ($row) {
-                    createNotification(
-                        $conn,
-                        (int)$row['requested_by'],
-                        '✅ Requisition Approved',
-                        'Your requisition ' . $row['req_number'] . ' has been approved by Finance.',
-                        'success',
-                        'success'
-                    );
+                    // Re-verify budget still available
+                    if ($req['b_id']) {
+                        $remaining = (float)$req['allocated_amount'] - (float)$req['spent_amount'];
+                        if ((float)$req['estimated_total'] > $remaining) {
+                            throw new Exception(
+                                "Budget depleted. Requested: ₱" . number_format((float)$req['estimated_total'], 2) .
+                                ", Remaining: ₱" . number_format($remaining, 2)
+                            );
+                        }
+
+                        $conn->prepare("
+                            UPDATE budgets
+                            SET spent_amount = spent_amount + ?,
+                                status = IF(spent_amount + ? >= allocated_amount, 'exhausted', status)
+                            WHERE id = ?
+                        ")->execute([
+                            (float)$req['estimated_total'],
+                            (float)$req['estimated_total'],
+                            (int)$req['b_id']
+                        ]);
+                    }
+
+                    $conn->prepare("
+                        UPDATE requisitions
+                        SET status = 'approved',
+                            approved_by = ?,
+                            approved_at = NOW()
+                        WHERE id = ?
+                    ")->execute([(int)$input['approved_by'], $id]);
+
+                    $conn->commit();
+
+                    if (function_exists('createNotification')) {
+                        createNotification(
+                            $conn,
+                            (int)$req['requested_by'],
+                            '✅ Requisition Approved',
+                            'Your requisition ' . $req['req_number'] . ' has been approved.',
+                            'success',
+                            'success'
+                        );
+                    }
+
+                    if (function_exists('notifyRole')) {
+                        notifyRole(
+                            $conn,
+                            ['supply_chain', 'super_admin', 'admin'],
+                            '📨 Ready for Sourcing — ' . $req['req_number'],
+                            'Approved requisition for ' . ($req['product_name'] ?? 'item') .
+                            ' x' . $req['quantity'] . '. Create a PO to proceed.',
+                            'info',
+                            'info'
+                        );
+                    }
+
+                    echo json_encode([
+                        'success' => true,
+                        'message' => 'Requisition approved & budget deducted'
+                    ]);
+                } catch (Throwable $e) {
+                    $conn->rollBack();
+                    throw $e;
                 }
 
-                echo json_encode(['success' => true, 'message' => 'Requisition approved']);
+            // -------- REJECT --------
             } elseif ($action === 'reject') {
                 $stmt = $conn->prepare("
                     UPDATE requisitions
@@ -171,7 +274,7 @@ try {
                         approved_by = ?,
                         approved_at = NOW(),
                         rejection_reason = ?
-                    WHERE id = ?
+                    WHERE id = ? AND status = 'pending_finance'
                 ");
                 $stmt->execute([
                     (int)$input['approved_by'],
@@ -183,7 +286,7 @@ try {
                 $r->execute([$id]);
                 $row = $r->fetch(PDO::FETCH_ASSOC);
 
-                if ($row) {
+                if ($row && function_exists('createNotification')) {
                     createNotification(
                         $conn,
                         (int)$row['requested_by'],
@@ -196,12 +299,57 @@ try {
                 }
 
                 echo json_encode(['success' => true, 'message' => 'Requisition rejected']);
+
+            // -------- CANCEL (refunds budget) --------
             } elseif ($action === 'cancel') {
-                $stmt = $conn->prepare("UPDATE requisitions SET status = 'cancelled' WHERE id = ?");
-                $stmt->execute([$id]);
-                echo json_encode(['success' => true, 'message' => 'Requisition cancelled']);
+                $conn->beginTransaction();
+                try {
+                    $r = $conn->prepare("
+                        SELECT budget_id, estimated_total, status
+                        FROM requisitions WHERE id = ? FOR UPDATE
+                    ");
+                    $r->execute([$id]);
+                    $req = $r->fetch(PDO::FETCH_ASSOC);
+
+                    if (!$req) throw new Exception('Requisition not found');
+                    if (in_array($req['status'], ['paid','completed','converted_to_po'], true)) {
+                        throw new Exception("Cannot cancel a requisition that is {$req['status']}");
+                    }
+
+                    // Refund budget if it was approved
+                    if ($req['status'] === 'approved' && $req['budget_id']) {
+                        $conn->prepare("
+                            UPDATE budgets
+                            SET spent_amount = GREATEST(0, spent_amount - ?),
+                                status = 'active'
+                            WHERE id = ?
+                        ")->execute([
+                            (float)$req['estimated_total'],
+                            (int)$req['budget_id']
+                        ]);
+                    }
+
+                    $conn->prepare("UPDATE requisitions SET status = 'cancelled' WHERE id = ?")
+                         ->execute([$id]);
+
+                    $conn->commit();
+                    echo json_encode([
+                        'success' => true,
+                        'message' => 'Requisition cancelled & budget refunded'
+                    ]);
+                } catch (Throwable $e) {
+                    $conn->rollBack();
+                    throw $e;
+                }
+
+            // -------- CONVERT (called by purchase_orders.php) --------
+            } elseif ($action === 'convert') {
+                $conn->prepare("UPDATE requisitions SET status = 'converted_to_po' WHERE id = ?")
+                     ->execute([$id]);
+                echo json_encode(['success' => true, 'message' => 'Marked as converted']);
+
+            // -------- GENERIC UPDATE --------
             } else {
-                // Generic field update
                 $allowed = ['product_id','product_name','quantity','estimated_unit_cost',
                             'estimated_total','cost_center','justification','urgency','status'];
                 $fields = []; $params = [];
@@ -222,7 +370,10 @@ try {
         case 'DELETE':
             $id = $_GET['id'] ?? null;
             if (!$id) throw new Exception('ID required');
-            $stmt = $conn->prepare("DELETE FROM requisitions WHERE id = ?");
+            $stmt = $conn->prepare("
+                DELETE FROM requisitions
+                WHERE id = ? AND status IN ('pending_finance','rejected','cancelled')
+            ");
             $stmt->execute([$id]);
             echo json_encode(['success' => true]);
             break;

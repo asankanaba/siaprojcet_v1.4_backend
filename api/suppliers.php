@@ -1,5 +1,5 @@
 <?php
-// api/suppliers.php — proper supplier CRUD
+// api/suppliers.php — supplier CRUD (no stock_available)
 header('Content-Type: application/json');
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS');
@@ -51,17 +51,14 @@ try {
             break;
 
         case 'POST':
-            $required = ['name'];
-            foreach ($required as $f) {
-                if (empty($input[$f])) throw new Exception("Missing required field: $f");
-            }
+            if (empty($input['name'])) throw new Exception("Missing required field: name");
 
             $stmt = $conn->prepare("
                 INSERT INTO suppliers
                     (name, contact_person, phone, email, address,
-                     product_id, stock_available, price_per_unit,
+                     product_id, price_per_unit,
                      lead_time_days, payment_terms, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ");
             $stmt->execute([
                 $input['name'],
@@ -70,7 +67,6 @@ try {
                 $input['email'] ?? null,
                 $input['address'] ?? null,
                 !empty($input['product_id']) ? (int)$input['product_id'] : null,
-                (int)($input['stock_available'] ?? 0),
                 (float)($input['price_per_unit'] ?? 0),
                 (int)($input['lead_time_days'] ?? 3),
                 $input['payment_terms'] ?? 'Net 30',
@@ -85,7 +81,7 @@ try {
             if (!$id) throw new Exception('ID required');
 
             $allowed = ['name','contact_person','phone','email','address','product_id',
-                        'stock_available','price_per_unit','lead_time_days',
+                        'price_per_unit','lead_time_days',
                         'payment_terms','status','avg_rating','total_orders','on_time_rate'];
             $fields = []; $params = [];
             foreach ($allowed as $f) {
@@ -101,7 +97,6 @@ try {
         case 'DELETE':
             $id = $_GET['id'] ?? null;
             if (!$id) throw new Exception('ID required');
-            // Soft delete → inactive
             $stmt = $conn->prepare("UPDATE suppliers SET status = 'inactive' WHERE id = ?");
             $stmt->execute([$id]);
             echo json_encode(['success' => true]);

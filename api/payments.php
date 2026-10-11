@@ -1,17 +1,13 @@
 <?php
 // ============================================================
 // 📁 File: api/payments.php
-// 💳 Payments API — PayMongo Checkout / Intent / Source / Link / Refund
-//    + POS QR payments (QR Ph) + manual bank/cash/cheque
+// 💳 Payments API — PayMongo + POS + manual
 // ============================================================
 declare(strict_types=1);
 header('Access-Control-Allow-Origin: *');
 header('Access-Control-Allow-Methods: GET, POST, PUT, OPTIONS');
-header('Access-Control-Allow-Headers: Content-Type, Authorization');
-header('Content-Type: application/json; charset=utf-8');
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: GET, POST, PUT, OPTIONS');
 header('Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With');
+header('Content-Type: application/json; charset=utf-8');
 header('Access-Control-Max-Age: 86400');
 
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'OPTIONS') { http_response_code(204); exit(); }
@@ -89,6 +85,39 @@ function build_line_item(string $name, float $amount, int $qty = 1): array {
     ];
 }
 
+// ============================================================
+// 🎯 PO LEDGER SYNC — call after ANY successful PO payment
+// ============================================================
+if (!function_exists('sync_po_payment')) {
+    function sync_po_payment(PDO $conn, int $poId, float $amount): void {
+        if ($poId <= 0 || $amount <= 0) return;
+
+        $conn->prepare("
+            UPDATE purchase_orders
+            SET amount_paid      = amount_paid + ?,
+                payment_status   = IF(amount_paid + ? >= total_cost - 0.01, 'paid', 'partial'),
+                lifecycle_status = IF(amount_paid + ? >= total_cost - 0.01, 'paid', lifecycle_status),
+                updated_at       = NOW()
+            WHERE id = ?
+        ")->execute([$amount, $amount, $amount, $poId]);
+
+        $chk = $conn->prepare("
+            SELECT requisition_id, payment_status
+            FROM purchase_orders WHERE id = ?
+        ");
+        $chk->execute([$poId]);
+        $row = $chk->fetch(PDO::FETCH_ASSOC);
+
+        if ($row && $row['payment_status'] === 'paid' && $row['requisition_id']) {
+            $conn->prepare("
+                UPDATE requisitions
+                SET status = 'paid', updated_at = NOW()
+                WHERE id = ?
+            ")->execute([(int)$row['requisition_id']]);
+        }
+    }
+}
+
 if (!function_exists('notifyRole')) {
     function notifyRole(PDO $conn, array $roles, string $title, string $message, string $type = 'info', string $severity = 'info'): void {
         try {
@@ -152,6 +181,27 @@ try {
                         SET status = 'succeeded', paymongo_status = ?, paid_at = COALESCE(paid_at, NOW())
                         WHERE id = ?
                     ")->execute([$remoteStatus, $pay['id']]);
+
+                    // 🎯 Sync PO ledger
+                    if (!empty($pay['po_id'])) {
+                        $dup = $conn->prepare("
+                            SELECT COUNT(*) FROM payments
+                            WHERE po_id = ? AND status = 'succeeded' AND id != ?
+                        ");
+                        $dup->execute([(int)$pay['po_id'], (int)$pay['id']]);
+                        if ((int)$dup->fetchColumn() === 0) {
+                            sync_po_payment($conn, (int)$pay['po_id'], (float)$pay['amount']);
+                        }
+                    }
+
+                    // Mark invoice paid
+                    if (!empty($pay['invoice_id'])) {
+                        $conn->prepare("
+                            UPDATE supplier_invoices
+                            SET status = 'paid', paid_at = COALESCE(paid_at, NOW()), payment_id = ?
+                            WHERE id = ? AND status = 'matched'
+                        ")->execute([(int)$pay['id'], (int)$pay['invoice_id']]);
+                    }
                 } elseif ($remoteStatus) {
                     $conn->prepare("UPDATE payments SET paymongo_status = ? WHERE id = ?")
                          ->execute([$remoteStatus, $pay['id']]);
@@ -166,6 +216,26 @@ try {
                         SET status = 'succeeded', paymongo_status = ?, paid_at = COALESCE(paid_at, NOW())
                         WHERE id = ?
                     ")->execute([$remoteStatus, $pay['id']]);
+
+                    // 🎯 Sync PO ledger
+                    if (!empty($pay['po_id'])) {
+                        $dup = $conn->prepare("
+                            SELECT COUNT(*) FROM payments
+                            WHERE po_id = ? AND status = 'succeeded' AND id != ?
+                        ");
+                        $dup->execute([(int)$pay['po_id'], (int)$pay['id']]);
+                        if ((int)$dup->fetchColumn() === 0) {
+                            sync_po_payment($conn, (int)$pay['po_id'], (float)$pay['amount']);
+                        }
+                    }
+
+                    if (!empty($pay['invoice_id'])) {
+                        $conn->prepare("
+                            UPDATE supplier_invoices
+                            SET status = 'paid', paid_at = COALESCE(paid_at, NOW()), payment_id = ?
+                            WHERE id = ? AND status = 'matched'
+                        ")->execute([(int)$pay['id'], (int)$pay['invoice_id']]);
+                    }
                 } elseif ($remoteStatus) {
                     $conn->prepare("UPDATE payments SET paymongo_status = ? WHERE id = ?")
                          ->execute([$remoteStatus, $pay['id']]);
@@ -222,12 +292,12 @@ try {
     }
 
     // ============================================================
-    // POST — dispatch by kind
+    // POST
     // ============================================================
     if ($method === 'POST') {
         $kind = strtolower(trim((string)($input['kind'] ?? 'create_checkout')));
 
-        // ---------- kind=record_manual ----------
+        // ---------- record_manual ----------
         if ($kind === 'record_manual') {
             require_fields($input, ['supplier_id','amount','method']);
             if (!in_array($input['method'], ['bank_transfer','cash','cheque'], true)) {
@@ -257,17 +327,9 @@ try {
                 ]);
                 $payId = (int) $conn->lastInsertId();
 
+                // 🎯 Sync PO ledger via helper
                 if (!empty($input['po_id'])) {
-                    $conn->prepare("
-                        UPDATE purchase_orders
-                        SET amount_paid = amount_paid + ?,
-                            payment_status = IF(amount_paid + ? >= total_cost, 'paid', 'partial')
-                        WHERE id = ?
-                    ")->execute([
-                        (float)$input['amount'],
-                        (float)$input['amount'],
-                        (int)$input['po_id'],
-                    ]);
+                    sync_po_payment($conn, (int)$input['po_id'], (float)$input['amount']);
                 }
                 if (!empty($input['invoice_id'])) {
                     $conn->prepare("UPDATE supplier_invoices SET status = 'paid' WHERE id = ?")
@@ -299,7 +361,7 @@ try {
             respond(200, ['success' => true, 'id' => $payId, 'payment_ref' => $ref]);
         }
 
-        // ---------- kind=create_checkout ----------
+        // ---------- create_checkout ----------
         if ($kind === 'create_checkout') {
             require_fields($input, ['supplier_id','amount']);
 
@@ -383,7 +445,7 @@ try {
             ]);
         }
 
-        // ---------- kind=create_intent ----------
+        // ---------- create_intent ----------
         if ($kind === 'create_intent') {
             require_fields($input, ['supplier_id','amount']);
 
@@ -448,7 +510,7 @@ try {
             ]);
         }
 
-        // ---------- kind=attach_intent ----------
+        // ---------- attach_intent ----------
         if ($kind === 'attach_intent') {
             require_fields($input, ['payment_id','payment_method_id']);
 
@@ -481,7 +543,7 @@ try {
             ]);
         }
 
-        // ---------- kind=create_source ----------
+        // ---------- create_source ----------
         if ($kind === 'create_source') {
             require_fields($input, ['supplier_id','amount','method']);
             $methodCode = strtolower((string)$input['method']);
@@ -557,7 +619,7 @@ try {
             ]);
         }
 
-        // ---------- kind=create_link ----------
+        // ---------- create_link ----------
         if ($kind === 'create_link') {
             require_fields($input, ['supplier_id','amount']);
 
@@ -617,11 +679,7 @@ try {
             ]);
         }
 
-        // ============================================================
-        // POS — kind=pos_checkout
-        // Uses QR Ph so PayMongo returns a scannable QR image.
-        // GCash / Maya / QR Ph all flow through the same rail.
-        // ============================================================
+        // ---------- pos_checkout ----------
         if ($kind === 'pos_checkout') {
             require_fields($input, ['sale_id', 'amount', 'method']);
 
@@ -633,7 +691,6 @@ try {
                 respond(400, ['success' => false, 'message' => "Unsupported wallet: {$wallet}"]);
             }
 
-            // Confirm sale exists
             $stmt = $conn->prepare("SELECT id, invoice_number, total, payment_status, paymongo_intent_id FROM sales WHERE id = ? LIMIT 1");
             $stmt->execute([$saleId]);
             $sale = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -642,7 +699,6 @@ try {
                 respond(400, ['success' => false, 'message' => 'Sale already paid']);
             }
 
-            // Create a FRESH intent
             $idem = 'pos:' . $sale['invoice_number'] . ':' . substr(hash('sha256', $amount . microtime()), 0, 16);
 
             $res = $pm->createPaymentIntent([
@@ -673,7 +729,6 @@ try {
                 respond(500, ['success' => false, 'message' => 'PayMongo did not return an intent_id', 'debug' => $intent]);
             }
 
-            // Create a QR Ph payment method
             $pmRes = $pm->createPaymentMethod(['type' => 'qrph']);
             if (!$pmRes['ok']) {
                 respond(400, [
@@ -688,7 +743,6 @@ try {
                 respond(500, ['success' => false, 'message' => 'PayMongo did not return a payment_method id', 'debug' => $pmData]);
             }
 
-            // Attach the payment method — this is where the QR is returned
             $attach = $pm->attachPaymentIntent($intentId, $pmId);
             if (!$attach['ok']) {
                 respond(400, [
@@ -702,7 +756,6 @@ try {
             $status   = $attached['attributes']['status']      ?? 'awaiting_next_action';
             $na       = $attached['attributes']['next_action'] ?? null;
 
-            // Persist the intent on the sale
             $conn->prepare("
                 UPDATE sales
                 SET payment_status      = 'pending',
@@ -710,17 +763,6 @@ try {
                     payment_reference   = NULL
                 WHERE id = ?
             ")->execute([$intentId, $saleId]);
-
-            paymongo_log('info', 'POS intent attached', [
-                'sale_id'    => $saleId,
-                'intent_id'  => $intentId,
-                'pm_id'      => $pmId,
-                'wallet'     => $wallet,
-                'status'     => $status,
-                'has_na'     => !empty($na),
-                'na_type'    => $na['type'] ?? null,
-                'has_qr'     => !empty($na['code']['image_url'] ?? null),
-            ]);
 
             respond(200, [
                 'success'     => true,
@@ -732,9 +774,7 @@ try {
             ]);
         }
 
-        // ============================================================
-        // POS — kind=pos_status
-        // ============================================================
+        // ---------- pos_status ----------
         if ($kind === 'pos_status') {
             require_fields($input, ['sale_id']);
             $saleId = (int) $input['sale_id'];
@@ -768,12 +808,6 @@ try {
                         $sale['payment_status']    = 'paid';
                         $sale['payment_reference'] = $payId ?: $sale['paymongo_intent_id'];
                         $sale['status']            = 'completed';
-
-                        paymongo_log('info', 'POS sale marked paid via poll fallback', [
-                            'sale_id'   => $saleId,
-                            'intent_id' => $sale['paymongo_intent_id'],
-                            'payment'   => $payId,
-                        ]);
                     } elseif (!in_array($remote, ['awaiting_payment_method','awaiting_next_action','processing'], true)) {
                         $conn->prepare("UPDATE sales SET payment_status = 'failed' WHERE id = ? AND payment_status = 'pending'")
                              ->execute([$saleId]);
@@ -794,9 +828,7 @@ try {
             ]);
         }
 
-        // ============================================================
-        // POS — kind=pos_manual_paid
-        // ============================================================
+        // ---------- pos_manual_paid ----------
         if ($kind === 'pos_manual_paid') {
             require_fields($input, ['sale_id', 'reference']);
             $saleId = (int) $input['sale_id'];
@@ -819,19 +851,10 @@ try {
                 WHERE id = ?
             ")->execute([$ref, $saleId]);
 
-            paymongo_log('warning', 'POS sale manually marked paid', [
-                'sale_id'   => $saleId,
-                'reference' => $ref,
-            ]);
-
             respond(200, ['success' => true, 'sale_id' => $saleId, 'payment_reference' => $ref]);
         }
 
-        // ============================================================
-        // POS — kind=pos_void
-        // Cashier cancels the sale. Marks cancelled and best-effort
-        // cancels the PayMongo intent so the QR stops working.
-        // ============================================================
+        // ---------- pos_void ----------
         if ($kind === 'pos_void') {
             require_fields($input, ['sale_id']);
             $saleId = (int) $input['sale_id'];
@@ -845,7 +868,6 @@ try {
                 respond(400, ['success' => false, 'message' => 'Cannot void a paid sale']);
             }
 
-            // Best-effort cancel of the PayMongo intent
             if (!empty($sale['paymongo_intent_id'])) {
                 try {
                     $pm->post('/payment_intents/' . $sale['paymongo_intent_id'] . '/cancel');
@@ -865,11 +887,6 @@ try {
                 WHERE id = ?
             ")->execute([$saleId]);
 
-            paymongo_log('info', 'POS sale voided by cashier', [
-                'sale_id' => $saleId,
-                'invoice' => $sale['invoice_number'],
-            ]);
-
             respond(200, [
                 'success' => true,
                 'sale_id' => $saleId,
@@ -877,7 +894,7 @@ try {
             ]);
         }
 
-        // ---------- kind=refund ----------
+        // ---------- refund ----------
         if ($kind === 'refund') {
             require_fields($input, ['payment_id']);
 
@@ -966,7 +983,7 @@ try {
     }
 
     // ============================================================
-    // PUT — manual override
+    // PUT
     // ============================================================
     if ($method === 'PUT') {
         $id = $_GET['id'] ?? ($input['id'] ?? null);
