@@ -619,8 +619,8 @@ try {
 
         // ============================================================
         // POS — kind=pos_checkout
-        // Uses QR Ph so PayMongo returns a scannable QR image.
-        // GCash / Maya / QR Ph all flow through the same rail.
+        // QR Ph flow: create intent → attach a QR Ph payment method →
+        // PayMongo returns next_action.code.image_url (the scannable QR).
         // ============================================================
         if ($kind === 'pos_checkout') {
             require_fields($input, ['sale_id', 'amount', 'method']);
@@ -633,7 +633,7 @@ try {
                 respond(400, ['success' => false, 'message' => "Unsupported wallet: {$wallet}"]);
             }
 
-            // Confirm sale exists
+            // 1) Confirm sale exists
             $stmt = $conn->prepare("SELECT id, invoice_number, total, payment_status, paymongo_intent_id FROM sales WHERE id = ? LIMIT 1");
             $stmt->execute([$saleId]);
             $sale = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -642,8 +642,7 @@ try {
                 respond(400, ['success' => false, 'message' => 'Sale already paid']);
             }
 
-            // Always create a FRESH intent — never reuse the old one,
-            // because it may have been created with an incompatible method.
+            // 2) Create Payment Intent
             $idem = 'pos:' . $sale['invoice_number'] . ':' . substr(hash('sha256', $amount . microtime()), 0, 16);
 
             $res = $pm->createPaymentIntent([
@@ -651,7 +650,6 @@ try {
                 'currency'               => 'PHP',
                 'description'            => 'POS sale ' . $sale['invoice_number'],
                 'statement_descriptor'   => 'SmartPOS',
-                // 👇 QR Ph — returns next_action.code.image_url (scannable QR)
                 'payment_method_allowed' => ['qrph'],
                 'metadata'               => [
                     'sale_id'        => (string) $saleId,
@@ -664,17 +662,48 @@ try {
             if (!$res['ok']) {
                 respond(400, [
                     'success' => false,
-                    'message' => 'PayMongo: ' . PayMongoClient::extractError($res),
+                    'message' => 'PayMongo intent: ' . PayMongoClient::extractError($res),
                     'debug'   => $res['body'],
                 ]);
             }
 
             $intent   = $res['body']['data'] ?? [];
             $intentId = $intent['id'] ?? null;
-            $status   = $intent['attributes']['status'] ?? 'awaiting_payment_method';
-            $na       = $intent['attributes']['next_action'] ?? null;
+            if (!$intentId) {
+                respond(500, ['success' => false, 'message' => 'PayMongo did not return an intent_id', 'debug' => $intent]);
+            }
 
-            // Persist intent
+            // 3) Create a QR Ph payment method
+            $pmRes = $pm->createPaymentMethod(['type' => 'qrph']);
+            if (!$pmRes['ok']) {
+                respond(400, [
+                    'success' => false,
+                    'message' => 'PayMongo payment_method: ' . PayMongoClient::extractError($pmRes),
+                    'debug'   => $pmRes['body'],
+                ]);
+            }
+            $pmData = $pmRes['body']['data'] ?? [];
+            $pmId   = $pmData['id'] ?? null;
+            if (!$pmId) {
+                respond(500, ['success' => false, 'message' => 'PayMongo did not return a payment_method id', 'debug' => $pmData]);
+            }
+
+            // 4) Attach the payment method to the intent — this is where
+            //    PayMongo returns the actual scannable QR.
+            $attach = $pm->attachPaymentIntent($intentId, $pmId);
+            if (!$attach['ok']) {
+                respond(400, [
+                    'success' => false,
+                    'message' => 'PayMongo attach: ' . PayMongoClient::extractError($attach),
+                    'debug'   => $attach['body'],
+                ]);
+            }
+
+            $attached = $attach['body']['data'] ?? [];
+            $status   = $attached['attributes']['status']    ?? 'awaiting_next_action';
+            $na       = $attached['attributes']['next_action'] ?? null;
+
+            // 5) Persist the intent on the sale
             $conn->prepare("
                 UPDATE sales
                 SET payment_status      = 'pending',
@@ -683,19 +712,22 @@ try {
                 WHERE id = ?
             ")->execute([$intentId, $saleId]);
 
-            paymongo_log('info', 'POS intent created', [
-                'sale_id'   => $saleId,
-                'intent_id' => $intentId,
-                'wallet'    => $wallet,
-                'status'    => $status,
-                'has_na'    => !empty($na),
-                'na_type'   => $na['type'] ?? null,
+            paymongo_log('info', 'POS intent attached', [
+                'sale_id'    => $saleId,
+                'intent_id'  => $intentId,
+                'pm_id'      => $pmId,
+                'wallet'     => $wallet,
+                'status'     => $status,
+                'has_na'     => !empty($na),
+                'na_type'    => $na['type'] ?? null,
+                'has_qr'     => !empty($na['code']['image_url'] ?? null),
             ]);
 
             respond(200, [
                 'success'     => true,
                 'sale_id'     => $saleId,
                 'intent_id'   => $intentId,
+                'pm_id'       => $pmId,
                 'status'      => $status,
                 'next_action' => $na,
             ]);
