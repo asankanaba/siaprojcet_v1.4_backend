@@ -2,7 +2,7 @@
 // ============================================================
 // 📁 File: api/payments.php
 // 💳 Payments API — PayMongo Checkout / Intent / Source / Link / Refund
-//    + POS QR payments + manual bank/cash/cheque
+//    + POS QR payments (QR Ph) + manual bank/cash/cheque
 // ============================================================
 declare(strict_types=1);
 header('Access-Control-Allow-Origin: *');
@@ -619,25 +619,21 @@ try {
 
         // ============================================================
         // POS — kind=pos_checkout
-        // Creates a Payment Intent for a POS sale and returns the QR.
+        // Uses QR Ph so PayMongo returns a scannable QR image.
+        // GCash / Maya / QR Ph all flow through the same rail.
         // ============================================================
         if ($kind === 'pos_checkout') {
             require_fields($input, ['sale_id', 'amount', 'method']);
 
             $saleId = (int) $input['sale_id'];
             $amount = (float) $input['amount'];
-            $method = strtolower(trim((string) $input['method']));
+            $wallet = strtolower(trim((string) $input['method']));
 
-            $map = [
-                'gcash' => 'gcash',
-                'maya'  => 'paymaya',
-                'qrph'  => 'qrph',
-            ];
-            if (!isset($map[$method])) {
-                respond(400, ['success' => false, 'message' => "POS checkout does not support method: {$method}"]);
+            if (!in_array($wallet, ['gcash','maya','qrph'], true)) {
+                respond(400, ['success' => false, 'message' => "Unsupported wallet: {$wallet}"]);
             }
-            $pmMethod = $map[$method];
 
+            // Confirm sale exists
             $stmt = $conn->prepare("SELECT id, invoice_number, total, payment_status, paymongo_intent_id FROM sales WHERE id = ? LIMIT 1");
             $stmt->execute([$saleId]);
             $sale = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -646,23 +642,8 @@ try {
                 respond(400, ['success' => false, 'message' => 'Sale already paid']);
             }
 
-            if (!empty($sale['paymongo_intent_id'])) {
-                $existing = $pm->retrievePaymentIntent($sale['paymongo_intent_id']);
-                if ($existing['ok']) {
-                    $attr = $existing['body']['data']['attributes'] ?? [];
-                    if (in_array($attr['status'] ?? '', ['awaiting_payment_method','awaiting_next_action'], true)) {
-                        respond(200, [
-                            'success'     => true,
-                            'sale_id'     => $saleId,
-                            'intent_id'   => $sale['paymongo_intent_id'],
-                            'status'      => $attr['status'],
-                            'next_action' => $attr['next_action'] ?? null,
-                            'reused'      => true,
-                        ]);
-                    }
-                }
-            }
-
+            // Always create a FRESH intent — never reuse the old one,
+            // because it may have been created with an incompatible method.
             $idem = 'pos:' . $sale['invoice_number'] . ':' . substr(hash('sha256', $amount . microtime()), 0, 16);
 
             $res = $pm->createPaymentIntent([
@@ -670,10 +651,12 @@ try {
                 'currency'               => 'PHP',
                 'description'            => 'POS sale ' . $sale['invoice_number'],
                 'statement_descriptor'   => 'SmartPOS',
-                'payment_method_allowed' => [$pmMethod],
+                // 👇 QR Ph — returns next_action.code.image_url (scannable QR)
+                'payment_method_allowed' => ['qrph'],
                 'metadata'               => [
                     'sale_id'        => (string) $saleId,
                     'invoice_number' => $sale['invoice_number'],
+                    'wallet'         => $wallet,
                     'source'         => 'pos',
                 ],
             ], $idem);
@@ -689,7 +672,9 @@ try {
             $intent   = $res['body']['data'] ?? [];
             $intentId = $intent['id'] ?? null;
             $status   = $intent['attributes']['status'] ?? 'awaiting_payment_method';
+            $na       = $intent['attributes']['next_action'] ?? null;
 
+            // Persist intent
             $conn->prepare("
                 UPDATE sales
                 SET payment_status      = 'pending',
@@ -701,8 +686,10 @@ try {
             paymongo_log('info', 'POS intent created', [
                 'sale_id'   => $saleId,
                 'intent_id' => $intentId,
-                'method'    => $method,
-                'amount'    => $amount,
+                'wallet'    => $wallet,
+                'status'    => $status,
+                'has_na'    => !empty($na),
+                'na_type'   => $na['type'] ?? null,
             ]);
 
             respond(200, [
@@ -710,13 +697,12 @@ try {
                 'sale_id'     => $saleId,
                 'intent_id'   => $intentId,
                 'status'      => $status,
-                'next_action' => $intent['attributes']['next_action'] ?? null,
+                'next_action' => $na,
             ]);
         }
 
         // ============================================================
         // POS — kind=pos_status
-        // Frontend polls this. Also a webhook fallback.
         // ============================================================
         if ($kind === 'pos_status') {
             require_fields($input, ['sale_id']);
