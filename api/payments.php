@@ -619,8 +619,8 @@ try {
 
         // ============================================================
         // POS — kind=pos_checkout
-        // QR Ph flow: create intent → attach a QR Ph payment method →
-        // PayMongo returns next_action.code.image_url (the scannable QR).
+        // Uses QR Ph so PayMongo returns a scannable QR image.
+        // GCash / Maya / QR Ph all flow through the same rail.
         // ============================================================
         if ($kind === 'pos_checkout') {
             require_fields($input, ['sale_id', 'amount', 'method']);
@@ -633,7 +633,7 @@ try {
                 respond(400, ['success' => false, 'message' => "Unsupported wallet: {$wallet}"]);
             }
 
-            // 1) Confirm sale exists
+            // Confirm sale exists
             $stmt = $conn->prepare("SELECT id, invoice_number, total, payment_status, paymongo_intent_id FROM sales WHERE id = ? LIMIT 1");
             $stmt->execute([$saleId]);
             $sale = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -642,7 +642,7 @@ try {
                 respond(400, ['success' => false, 'message' => 'Sale already paid']);
             }
 
-            // 2) Create Payment Intent
+            // Create a FRESH intent
             $idem = 'pos:' . $sale['invoice_number'] . ':' . substr(hash('sha256', $amount . microtime()), 0, 16);
 
             $res = $pm->createPaymentIntent([
@@ -673,7 +673,7 @@ try {
                 respond(500, ['success' => false, 'message' => 'PayMongo did not return an intent_id', 'debug' => $intent]);
             }
 
-            // 3) Create a QR Ph payment method
+            // Create a QR Ph payment method
             $pmRes = $pm->createPaymentMethod(['type' => 'qrph']);
             if (!$pmRes['ok']) {
                 respond(400, [
@@ -688,8 +688,7 @@ try {
                 respond(500, ['success' => false, 'message' => 'PayMongo did not return a payment_method id', 'debug' => $pmData]);
             }
 
-            // 4) Attach the payment method to the intent — this is where
-            //    PayMongo returns the actual scannable QR.
+            // Attach the payment method — this is where the QR is returned
             $attach = $pm->attachPaymentIntent($intentId, $pmId);
             if (!$attach['ok']) {
                 respond(400, [
@@ -700,10 +699,10 @@ try {
             }
 
             $attached = $attach['body']['data'] ?? [];
-            $status   = $attached['attributes']['status']    ?? 'awaiting_next_action';
+            $status   = $attached['attributes']['status']      ?? 'awaiting_next_action';
             $na       = $attached['attributes']['next_action'] ?? null;
 
-            // 5) Persist the intent on the sale
+            // Persist the intent on the sale
             $conn->prepare("
                 UPDATE sales
                 SET payment_status      = 'pending',
@@ -826,6 +825,56 @@ try {
             ]);
 
             respond(200, ['success' => true, 'sale_id' => $saleId, 'payment_reference' => $ref]);
+        }
+
+        // ============================================================
+        // POS — kind=pos_void
+        // Cashier cancels the sale. Marks cancelled and best-effort
+        // cancels the PayMongo intent so the QR stops working.
+        // ============================================================
+        if ($kind === 'pos_void') {
+            require_fields($input, ['sale_id']);
+            $saleId = (int) $input['sale_id'];
+
+            $stmt = $conn->prepare("SELECT id, invoice_number, payment_status, paymongo_intent_id FROM sales WHERE id = ? LIMIT 1");
+            $stmt->execute([$saleId]);
+            $sale = $stmt->fetch(PDO::FETCH_ASSOC);
+            if (!$sale) respond(404, ['success' => false, 'message' => 'Sale not found']);
+
+            if ($sale['payment_status'] === 'paid') {
+                respond(400, ['success' => false, 'message' => 'Cannot void a paid sale']);
+            }
+
+            // Best-effort cancel of the PayMongo intent
+            if (!empty($sale['paymongo_intent_id'])) {
+                try {
+                    $pm->post('/payment_intents/' . $sale['paymongo_intent_id'] . '/cancel');
+                } catch (Throwable $e) {
+                    paymongo_log('warning', 'pos_void: could not cancel PayMongo intent', [
+                        'sale_id'   => $saleId,
+                        'intent_id' => $sale['paymongo_intent_id'],
+                        'error'     => $e->getMessage(),
+                    ]);
+                }
+            }
+
+            $conn->prepare("
+                UPDATE sales
+                SET payment_status = 'cancelled',
+                    status         = 'voided'
+                WHERE id = ?
+            ")->execute([$saleId]);
+
+            paymongo_log('info', 'POS sale voided by cashier', [
+                'sale_id' => $saleId,
+                'invoice' => $sale['invoice_number'],
+            ]);
+
+            respond(200, [
+                'success' => true,
+                'sale_id' => $saleId,
+                'message' => 'Sale voided',
+            ]);
         }
 
         // ---------- kind=refund ----------
