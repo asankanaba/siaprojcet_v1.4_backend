@@ -4,17 +4,12 @@
 # Logs
 /logs/
 *.log
-
 # User uploads
 /uploads/
-
 # Local env files
 .env
 .env.local
-
 # 🔐 Cloudinary credentials (never commit)
-
-
 # IDE
 .vscode/
-.idea/
+.idea/.env

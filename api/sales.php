@@ -13,7 +13,6 @@ header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-W
 header("Access-Control-Allow-Credentials: true");
 header("Content-Type: application/json");
 
-// Handle preflight
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
     exit();
@@ -43,7 +42,6 @@ $search = isset($_GET['search']) ? $_GET['search'] : '';
 if ($method === 'GET') {
     try {
         if ($id) {
-            // Get single sale with items
             $query = "SELECT s.*, 
                       u.full_name as cashier_name,
                       c.name as customer_name 
@@ -57,7 +55,6 @@ if ($method === 'GET') {
             $sale = $stmt->fetch(PDO::FETCH_ASSOC);
             
             if ($sale) {
-                // Get sale items
                 $itemsQuery = "SELECT si.*, p.name as product_name 
                                FROM sale_items si
                                LEFT JOIN products p ON si.product_id = p.id
@@ -73,7 +70,6 @@ if ($method === 'GET') {
                 echo json_encode(['success' => false, 'message' => 'Sale not found']);
             }
         } else {
-            // Get all sales with filters
             $query = "SELECT s.*, 
                       u.full_name as cashier_name,
                       c.name as customer_name 
@@ -89,7 +85,6 @@ if ($method === 'GET') {
                 $params[':search'] = "%$search%";
             }
             
-            // ✅ FIXED: Use s.created_at instead of created_at
             $query .= " ORDER BY s.created_at DESC LIMIT :limit";
             $params[':limit'] = $limit;
             
@@ -104,7 +99,6 @@ if ($method === 'GET') {
             $stmt->execute();
             $results = $stmt->fetchAll(PDO::FETCH_ASSOC);
             
-            // If no results, return sample data
             if (empty($results)) {
                 $sampleData = [
                     [
@@ -118,18 +112,6 @@ if ($method === 'GET') {
                         'cashier_name' => 'John Doe',
                         'customer_name' => 'Walk-in',
                         'created_at' => date('Y-m-d H:i:s', strtotime('-1 day'))
-                    ],
-                    [
-                        'id' => 2,
-                        'invoice_number' => 'INV-20260002',
-                        'subtotal' => 2500.00,
-                        'tax' => 300.00,
-                        'total' => 2800.00,
-                        'payment_method' => 'card',
-                        'status' => 'completed',
-                        'cashier_name' => 'Jane Smith',
-                        'customer_name' => 'Walk-in',
-                        'created_at' => date('Y-m-d H:i:s', strtotime('-2 days'))
                     ]
                 ];
                 echo json_encode($sampleData);
@@ -155,7 +137,6 @@ if ($method === 'POST') {
             exit();
         }
         
-        // Start transaction
         $conn->beginTransaction();
         
         $invoice_number = isset($data['invoice_number']) ? $data['invoice_number'] : 'INV-' . date('Ymd') . rand(1000, 9999);
@@ -170,12 +151,18 @@ if ($method === 'POST') {
         $change_amount = isset($data['change_amount']) ? floatval($data['change_amount']) : 0;
         $status = isset($data['status']) ? $data['status'] : 'completed';
         $items = isset($data['items']) ? $data['items'] : [];
+
+        // ✅ POS payment fields (optional; defaults preserve current behavior)
+        $payment_status     = isset($data['payment_status'])     ? $data['payment_status']     : 'paid';
+        $paymongo_intent_id = isset($data['paymongo_intent_id']) ? $data['paymongo_intent_id'] : null;
+        $payment_reference  = isset($data['payment_reference'])  ? $data['payment_reference']  : null;
         
-        // Insert sale
         $query = "INSERT INTO sales (invoice_number, customer_id, user_id, subtotal, discount, tax, total, 
-                  payment_method, payment_amount, change_amount, status) 
+                  payment_method, payment_amount, change_amount, status,
+                  payment_status, paymongo_intent_id, payment_reference) 
                   VALUES (:invoice_number, :customer_id, :user_id, :subtotal, :discount, :tax, :total, 
-                  :payment_method, :payment_amount, :change_amount, :status)";
+                  :payment_method, :payment_amount, :change_amount, :status,
+                  :payment_status, :paymongo_intent_id, :payment_reference)";
         
         $stmt = $conn->prepare($query);
         $stmt->bindValue(':invoice_number', $invoice_number);
@@ -189,6 +176,9 @@ if ($method === 'POST') {
         $stmt->bindValue(':payment_amount', $payment_amount);
         $stmt->bindValue(':change_amount', $change_amount);
         $stmt->bindValue(':status', $status);
+        $stmt->bindValue(':payment_status', $payment_status);
+        $stmt->bindValue(':paymongo_intent_id', $paymongo_intent_id);
+        $stmt->bindValue(':payment_reference', $payment_reference);
         
         if (!$stmt->execute()) {
             throw new Exception('Failed to create sale');
@@ -196,7 +186,6 @@ if ($method === 'POST') {
         
         $sale_id = $conn->lastInsertId();
         
-        // Insert sale items
         if (!empty($items)) {
             $itemQuery = "INSERT INTO sale_items (sale_id, product_id, quantity, price, total) 
                           VALUES (:sale_id, :product_id, :quantity, :price, :total)";
@@ -215,7 +204,6 @@ if ($method === 'POST') {
                 $itemStmt->bindValue(':total', $item_total);
                 $itemStmt->execute();
                 
-                // Update product stock
                 $updateStock = "UPDATE products SET stock = stock - :quantity WHERE id = :product_id";
                 $stockStmt = $conn->prepare($updateStock);
                 $stockStmt->bindValue(':quantity', $quantity);
@@ -262,7 +250,6 @@ if ($method === 'PUT') {
             exit();
         }
         
-        // Check if sale exists
         $checkQuery = "SELECT id FROM sales WHERE id = :id";
         $checkStmt = $conn->prepare($checkQuery);
         $checkStmt->bindValue(':id', $id);
@@ -292,6 +279,18 @@ if ($method === 'PUT') {
         if (isset($data['change_amount'])) {
             $updates[] = "change_amount = :change_amount";
             $params[':change_amount'] = $data['change_amount'];
+        }
+        if (isset($data['payment_status'])) {
+            $updates[] = "payment_status = :payment_status";
+            $params[':payment_status'] = $data['payment_status'];
+        }
+        if (isset($data['payment_reference'])) {
+            $updates[] = "payment_reference = :payment_reference";
+            $params[':payment_reference'] = $data['payment_reference'];
+        }
+        if (isset($data['paymongo_intent_id'])) {
+            $updates[] = "paymongo_intent_id = :paymongo_intent_id";
+            $params[':paymongo_intent_id'] = $data['paymongo_intent_id'];
         }
         
         if (empty($updates)) {
@@ -331,7 +330,6 @@ if ($method === 'DELETE') {
             exit();
         }
         
-        // Check if sale exists
         $checkQuery = "SELECT id FROM sales WHERE id = :id";
         $checkStmt = $conn->prepare($checkQuery);
         $checkStmt->bindValue(':id', $id);
@@ -343,13 +341,11 @@ if ($method === 'DELETE') {
             exit();
         }
         
-        // Delete sale items first
         $itemsQuery = "DELETE FROM sale_items WHERE sale_id = :sale_id";
         $itemsStmt = $conn->prepare($itemsQuery);
         $itemsStmt->bindValue(':sale_id', $id);
         $itemsStmt->execute();
         
-        // Delete sale
         $query = "DELETE FROM sales WHERE id = :id";
         $stmt = $conn->prepare($query);
         $stmt->bindValue(':id', $id);
@@ -369,7 +365,6 @@ if ($method === 'DELETE') {
     exit();
 }
 
-// Method not allowed
 http_response_code(405);
 echo json_encode(['success' => false, 'message' => 'Method not allowed']);
 exit();

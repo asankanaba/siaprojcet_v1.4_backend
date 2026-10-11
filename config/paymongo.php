@@ -5,8 +5,8 @@
 // ============================================
 
 // ---------- Keys ----------
-define('PAYMONGO_SECRET_KEY',     getenv('PAYMONGO_SECRET_KEY')     ?: 'sk_test_BkGrUXg4fZGcHdohDbkNQj2N');
-define('PAYMONGO_PUBLIC_KEY',     getenv('PAYMONGO_PUBLIC_KEY')     ?: 'pk_test_gzzQQfyHXCzfEAqhDiD8WZQL');
+define('PAYMONGO_SECRET_KEY',     getenv('PAYMONGO_SECRET_KEY')     ?: 'sk_test_REDACTED');
+define('PAYMONGO_PUBLIC_KEY',     getenv('PAYMONGO_PUBLIC_KEY')     ?: 'pk_test_REDACTED');
 define('PAYMONGO_WEBHOOK_SECRET', getenv('PAYMONGO_WEBHOOK_SECRET') ?: '');
 
 // ---------- API ----------

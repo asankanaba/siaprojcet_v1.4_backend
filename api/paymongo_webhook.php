@@ -2,19 +2,15 @@
 // ============================================================
 // 📁 File: api/paymongo_webhook.php
 // 🌐 PUBLIC endpoint — PayMongo POSTs events here.
-//    Register this URL in PayMongo dashboard → Developers → Webhooks:
-//      Dev:  http://<your-lan-ip>/smart-pos-api/api/paymongo_webhook.php
-//      Prod: https://your-domain.com/api/paymongo_webhook.php
-//    Events to subscribe:
+//    Events subscribed:
 //      - payment.paid
 //      - payment.failed
 //      - checkout_session.payment.paid
 //      - source.chargeable
-//      - refund.updated
-//      - refund.succeeded
+//      - refund.updated / succeeded / failed
 //      - link.payment.paid
-//    ✅ Updates linked supply_chain_requests when payment succeeds
-//    ✅ Also updates supplier_invoices + logs transactions
+//    ✅ Handles BOTH supplier payments (payments table)
+//       AND POS sales (sales table) via paymongo_intent_id
 // ============================================================
 declare(strict_types=1);
 
@@ -196,6 +192,52 @@ function handle_payment_paid(PDO $conn, string $eventType, array $eventData): ar
     $resourceId = $eventData['id'] ?? null;
     $attrs      = $eventData['attributes'] ?? [];
 
+    // ============================================================
+    // POS BRANCH — check sales table FIRST.
+    // ============================================================
+    $posIntentId = $attrs['payment_intent_id']
+                ?? (is_string($resourceId) && strpos($resourceId, 'pi_') === 0 ? $resourceId : null);
+
+    if ($posIntentId) {
+        $stmt = $conn->prepare("SELECT id, invoice_number, total, payment_status FROM sales WHERE paymongo_intent_id = ? LIMIT 1");
+        $stmt->execute([$posIntentId]);
+        $posSale = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($posSale) {
+            $paymongoPaymentId = $attrs['payments'][0]['id'] ?? ($attrs['payment_id'] ?? $posIntentId);
+
+            $conn->prepare("
+                UPDATE sales
+                SET payment_status    = 'paid',
+                    payment_reference = COALESCE(payment_reference, ?),
+                    status            = 'completed'
+                WHERE id = ?
+                  AND payment_status <> 'paid'
+            ")->execute([$paymongoPaymentId, $posSale['id']]);
+
+            paymongo_log('info', 'Webhook: POS sale marked paid', [
+                'sale_id'    => (int) $posSale['id'],
+                'invoice'    => $posSale['invoice_number'],
+                'intent_id'  => $posIntentId,
+                'payment_id' => $paymongoPaymentId,
+            ]);
+
+            notifyRole(
+                $conn,
+                ['admin','super_admin','finance'],
+                '💰 POS Sale Paid — ' . $posSale['invoice_number'],
+                'QR payment of ₱' . number_format((float)$posSale['total'], 2) . ' confirmed via PayMongo.',
+                'success',
+                'success'
+            );
+
+            return ['handled' => true, 'message' => 'POS sale marked paid', 'payment_id' => null];
+        }
+    }
+    // ============================================================
+    // END POS BRANCH — fall through to supplier logic.
+    // ============================================================
+
     $pay = null;
 
     if (!$pay && $resourceId && strpos($resourceId, 'cs_') === 0) {
@@ -245,7 +287,6 @@ function handle_payment_paid(PDO $conn, string $eventType, array $eventData): ar
 
     $conn->beginTransaction();
     try {
-        // 1. Mark payment as succeeded
         $conn->prepare("
             UPDATE payments
             SET status = 'succeeded',
@@ -265,7 +306,6 @@ function handle_payment_paid(PDO $conn, string $eventType, array $eventData): ar
             $pay['id'],
         ]);
 
-        // 2. Update purchase_orders + linked supply_chain_requests
         if (!empty($pay['po_id'])) {
             $conn->prepare("
                 UPDATE purchase_orders
@@ -281,7 +321,6 @@ function handle_payment_paid(PDO $conn, string $eventType, array $eventData): ar
                 (int)$pay['po_id'],
             ]);
 
-            // ✅ Update linked supply_chain_requests — broader status filter
             $updReq = $conn->prepare("
                 UPDATE supply_chain_requests r
                 JOIN purchase_orders po ON po.requisition_id = r.id
@@ -300,13 +339,11 @@ function handle_payment_paid(PDO $conn, string $eventType, array $eventData): ar
             ]);
         }
 
-        // 3. Update supplier invoice if present
         if (!empty($pay['invoice_id'])) {
             $conn->prepare("UPDATE supplier_invoices SET status = 'paid' WHERE id = ?")
                  ->execute([(int)$pay['invoice_id']]);
         }
 
-        // 4. Log expense transaction
         $conn->prepare("
             INSERT INTO transactions
                 (description, amount, type, category, date, status, reference)
@@ -317,7 +354,6 @@ function handle_payment_paid(PDO $conn, string $eventType, array $eventData): ar
             $pay['payment_ref'],
         ]);
 
-        // 5. Notify roles
         notifyRole(
             $conn,
             ['finance','supply_chain','super_admin','admin'],
@@ -341,6 +377,30 @@ function handle_payment_failed(PDO $conn, array $eventData): array
     $resourceId = $eventData['id']     ?? null;
     $attrs      = $eventData['attributes'] ?? [];
     $intentId   = $attrs['payment_intent_id'] ?? ($resourceId && strpos($resourceId, 'pi_') === 0 ? $resourceId : null);
+
+    // ============================================================
+    // POS BRANCH — check sales table FIRST.
+    // ============================================================
+    if ($intentId) {
+        $stmt = $conn->prepare("SELECT id, invoice_number FROM sales WHERE paymongo_intent_id = ? LIMIT 1");
+        $stmt->execute([$intentId]);
+        $posSale = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($posSale) {
+            $reason = $attrs['last_payment_error']['message']
+                   ?? $attrs['failure_reason']
+                   ?? 'Payment failed';
+            $conn->prepare("UPDATE sales SET payment_status = 'failed' WHERE id = ? AND payment_status = 'pending'")
+                 ->execute([$posSale['id']]);
+            paymongo_log('warning', 'Webhook: POS sale marked failed', [
+                'sale_id' => (int) $posSale['id'],
+                'reason'  => $reason,
+            ]);
+            return ['handled' => true, 'message' => 'POS sale marked failed', 'payment_id' => null];
+        }
+    }
+    // ============================================================
+    // END POS BRANCH
+    // ============================================================
 
     if (!$intentId) {
         return ['handled' => false, 'message' => 'No intent id on failed payment', 'payment_id' => null];
